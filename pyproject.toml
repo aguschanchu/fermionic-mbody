@@ -3,25 +3,50 @@ requires = ["setuptools>=65", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fermionic-mbody"
+name = "fermionic-mbody"                # ⇐ PyPI / pip name  (dash preferred)
 version = "0.1.0"
-description = "Reusable utilities for m-body density matrices in OpenFermion"
-authors = [{name = "Agustin Cianciulli", email = "agustin@example.org"}]
+description = "Utilities for m-body reduced density matrices in OpenFermion"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Agustin Cianciulli"},
+]
+
+# -------- hard runtime deps -----------------------------------------
 dependencies = [
-    "numpy",
-    "scipy",
-    "openfermion",
-    "sparse",
-    "tqdm",
-    "numba",
+  "numpy>=1.23",
+  "scipy>=1.10",
+  "openfermion",
+  "sparse>=0.14",
+  "tqdm>=4.66",
+  "numba>=0.58",
 ]
 
 [project.optional-dependencies]
+
+# --- development / CI / docs ----------------------------------------
 dev = [
-    "pytest",
-    "pytest-cov",
+  "pytest>=7.4",
+  "pytest-cov>=4.1",
+  "ruff>=0.4",          # style / lint
+  "mypy>=1.9",          # static typing
 ]
 
+# --- heavy chemistry stack used by datasets/h2o.py -------------------
+chem = [
+  "pyscf",
+  "openfermionpyscf",
+  "matplotlib",
+]
+
+#######################################################################
+# Setuptools package discovery
+#######################################################################
+[tool.setuptools]
+include-package-data = true
+
 [tool.setuptools.packages.find]
-where = ["."]
+where   = ["."]
+include = ["fermionic_mbody*"]          # main code + datasets sub-package
+

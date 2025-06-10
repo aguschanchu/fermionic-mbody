@@ -1,10 +1,9 @@
-# tests/test_05_pairs_kkbar.py
 """
 Pair-space sanity check for rho_2_kkbar_gen (pairs=True).
 
 For d = 4 (two time-reversed pairs) we prepare the equal superposition
 
-    |Ψ⟩ = (|1100⟩ + |0011⟩) / √2
+    |Ψ⟩ = (|11110000⟩ + |00001111⟩) / √2
 
 and verify that the **row-sums** of ρ₂_kk̄ equal the pair occupancies
 ⟨n_k n_{k̄}⟩ = diag ρ₁[even indices].  This identity holds for every

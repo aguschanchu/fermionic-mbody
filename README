@@ -1,0 +1,21 @@
+### Installing
+
+pip install fermionic-mbody[chem]
+
+### Example
+import fermionic_mbody as fmb
+import scipy 
+import numpy as np
+
+basis = fmb.FixedBasis(d=14, num=10, pairs=False)
+
+H, mol, inp = fmb.datasets.h2o.generate(r=4.0)
+H = H[np.ix_(basis.num_ele, basis.num_ele)].real # Basis subspace
+e, v = scipy.sparse.linalg.eigsh(H, k=1, which='SA', tol=1e-8)
+fund = v[:, 0]
+
+m = 1 # RDM number
+rho_m_arrays = fmb.rho_m_gen(basis, m)
+rho_mat = fmb.rho_m(fund, rho_m_arrays)
+
+np.sort(np.linalg.eigvals(rho_mat.todense()))
