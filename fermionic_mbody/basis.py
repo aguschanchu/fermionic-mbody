@@ -119,6 +119,11 @@ class FixedBasis:
         idxs = [(i, 1) for i, b in enumerate(bits) if b == "1"]
         return of.FermionOperator(idxs)
 
+    @property
+    def m(self) -> Optional[int]:
+        """Alias for *num* (kept for backward-compatibility)."""
+        return self.num
+
     # ---------------------------------------------------------------------
     # internal machinery
     # ---------------------------------------------------------------------
@@ -158,6 +163,41 @@ class FixedBasis:
             coeff = next(iter(op_n.terms.values())) if op_n.terms else 0
             signs.append(np.sign(coeff))
         return np.asarray(signs)
+
+    # -----------------------------------------------------------------
+    # alternate constructor: build a Basis from a subset of another one
+    # -----------------------------------------------------------------
+    @classmethod
+    def from_subset(
+        cls,
+        parent: "FixedBasis",
+        indices: "np.ndarray | list[int]",
+    ) -> "FixedBasis":
+        """
+        Build a *new* FixedBasis that keeps only `indices` from `parent`.
+
+        Parameters
+        ----------
+        parent
+            The full FixedBasis you want to down-select.
+        indices
+            1-D sequence (list, tuple, ndarray) of integer indices to keep.
+
+        Notes
+        -----
+        * All cache arrays (``size``, ``canonicals``, ``signs``) are rebuilt
+          consistently.
+        * The new instance inherits ``d``, ``num`` and ``pairs`` from
+          `parent`; you can change them afterwards if you really need to.
+        """
+        new = cls(d=parent.d, num=parent.num, pairs=parent.pairs)  # empty
+        new.base     = [parent.base[i] for i in indices]
+        new.num_ele  = np.asarray(parent.num_ele)[indices]
+        new.size     = len(new.base)
+        new.canonicals = np.eye(new.size)
+        new.signs    = new._signs_gen()
+        return new
+
 
     # ---------------------------------------------------------------------
     # convenience FermionOperator factories
