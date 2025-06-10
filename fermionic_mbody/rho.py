@@ -15,6 +15,7 @@ from typing import List, Tuple
 import numpy as np
 import openfermion as of
 import sparse
+from multiprocessing import cpu_count
 
 from ._parallel import chunked
 from .basis import FixedBasis
@@ -25,6 +26,14 @@ __all__ = [
     "rho_2_kkbar_gen",
     "rho_m",
 ]
+
+
+# ---------------------------------------------------------------------
+# helper ─ guarantee at least one worker
+# ---------------------------------------------------------------------
+def _ensure_workers(n_workers: int | None) -> int:
+    """Return a strictly positive worker count (defaults to all CPUs)."""
+    return max(1, n_workers or cpu_count())
 
 
 # ---------------------------------------------------------------------
@@ -88,7 +97,8 @@ def rho_m_gen(
     """
     m_basis = FixedBasis(basis.d, num=m, pairs=basis.pairs)
     shape = (m_basis.size, m_basis.size, basis.size, basis.size)
-
+    n_workers = _ensure_workers(n_workers)
+    
     chunks = np.array_split(np.arange(m_basis.size), n_workers or 0)
 
     results = chunked(
@@ -162,6 +172,8 @@ def rho_2_block_gen(basis: FixedBasis, *, n_workers: int | None = None) -> spars
     """
     m_pairs = basis.d // 2
     it_set = np.arange(m_pairs**2)
+    n_workers = _ensure_workers(n_workers)
+
     chunks = np.array_split(it_set, n_workers or 0)
 
     results = chunked(
@@ -227,6 +239,8 @@ def rho_2_kkbar_gen(basis: FixedBasis, *, n_workers: int | None = None) -> spars
     """
     m_pairs = basis.d // 2
     it_set = np.arange(m_pairs)
+    n_workers = _ensure_workers(n_workers)
+    
     chunks = np.array_split(it_set, n_workers or 0)
 
     results = chunked(
