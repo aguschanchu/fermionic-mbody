@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fermionic-mbody"
+version = "0.1.0"
+description = "Reusable utilities for m-body density matrices in OpenFermion"
+authors = [{name = "Agustin Cianciulli", email = "agustin@example.org"}]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "openfermion",
+    "sparse",
+    "tqdm",
+    "numba",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
