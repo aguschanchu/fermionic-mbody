@@ -95,7 +95,7 @@ def rho_m_gen(
         ``m_dim = |FixedBasis(d, num=m)|`` and
         ``N_dim = basis.size``.
     """
-    m_basis = FixedBasis(basis.d, num=m, pairs=basis.pairs)
+    m_basis = FixedBasis(basis.d, num=m)
     shape = (m_basis.size, m_basis.size, basis.size, basis.size)
     n_workers = _ensure_workers(n_workers)
     
@@ -240,7 +240,7 @@ def rho_2_kkbar_gen(basis: FixedBasis, *, n_workers: int | None = None) -> spars
     m_pairs = basis.d // 2
     it_set = np.arange(m_pairs)
     n_workers = _ensure_workers(n_workers)
-    
+
     chunks = np.array_split(it_set, n_workers or 0)
 
     results = chunked(
