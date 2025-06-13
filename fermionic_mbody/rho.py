@@ -19,6 +19,7 @@ from multiprocessing import cpu_count
 
 from ._parallel import chunked
 from .basis import FixedBasis
+from ._ofsparse import number_preserving_matrix, restrict_sector_matrix
 
 __all__ = [
     "rho_m_gen",
@@ -29,12 +30,11 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------
-# helper ─ guarantee at least one worker
+# helpers
 # ---------------------------------------------------------------------
 def _ensure_workers(n_workers: int | None) -> int:
     """Return a strictly positive worker count (defaults to all CPUs)."""
     return max(1, n_workers or cpu_count())
-
 
 # ---------------------------------------------------------------------
 # generic ρ(m) tensor
@@ -61,10 +61,8 @@ def _process_m_chunk(
     for ii in ii_chunk:
         for jj in range(m_basis.size):
             op = m_basis.base[jj] * of.utils.hermitian_conjugated(m_basis.base[ii])
-            mat = np.real(
-                of.get_sparse_operator(op, n_qubits=basis.d)
-            )[np.ix_(basis.num_ele, basis.num_ele)]
-
+            mat = number_preserving_matrix(op, basis.d, basis.num)
+            mat = restrict_sector_matrix(mat, basis.num_ele, basis.d, basis.num)
             rows, cols = mat.nonzero()
             indices.extend([[ii, jj, r, c] for r, c in zip(rows, cols)])
             values.extend(mat.data)
@@ -146,9 +144,7 @@ def _block_worker(
             k, l = divmod(int(idx2), m_pairs)
             op1 = of.FermionOperator(((2 * k, 1), (2 * l + 1, 1)))
 
-            mat = np.real(
-                of.get_sparse_operator(op1 * op2, n_qubits=basis.d)
-            )[np.ix_(basis.num_ele, basis.num_ele)]
+            mat = number_preserving_matrix(op, basis.d, basis.num)
 
             rows, cols = mat.nonzero()
             for r, c, v in zip(rows, cols, mat.data):
@@ -216,9 +212,7 @@ def _kkbar_worker(
             jj = int(jj)  # pair index for the *column*
             op1 = of.FermionOperator(((2 * jj, 1), (2 * jj + 1, 1)))
 
-            mat = np.real(
-                of.get_sparse_operator(op1 * op2, n_qubits=basis.d)
-            )[np.ix_(basis.num_ele, basis.num_ele)]
+            mat = number_preserving_matrix(op, basis.d, basis.num)
 
             rows, cols = mat.nonzero()
             for r, c, v in zip(rows, cols, mat.data):
