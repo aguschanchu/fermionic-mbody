@@ -104,6 +104,80 @@ class FixedBasis:
         bra, ket = map(self.idx_to_repr, (bra_idx, ket_idx))
         return float(np.real(bra.T @ of.get_sparse_operator(op, self.d) @ ket))
 
+    # .....................................................................
+    @property
+    def _mask2idx(self) -> dict[int, int]:
+        return {int(mask): idx for idx, mask in enumerate(self.num_ele)}
+
+    # .....................................................................
+    def opr_to_vect(self,
+                    opr: of.FermionOperator,
+                    *,
+                    dtype=np.complex128,
+                    tol: float = 0.0,
+                    allow_missing: bool = False) -> np.ndarray:
+            """
+            Expand a (number-conserving) FermionOperator in this basis.
+
+            Parameters
+            ----------
+            opr : FermionOperator
+                The operator to be expanded.  It must be a sum of pure
+                *creation* strings whose particle number equals
+                ``self.num`` (i.e. the m-body basis you built).
+            dtype : numpy dtype, optional
+                Type of the returned vector (default complex128).
+            tol : float, optional
+                Terms with |coeff| < tol are ignored.
+            allow_missing : bool, optional
+                If True the routine silently skips strings that are not
+                present in the basis; otherwise it raises a ValueError.
+
+            Returns
+            -------
+            vec : ndarray, shape (|basis|,)
+                Coefficient vector such that
+                    Σ_k vec[k] · basis.base[k]  ==  opr
+                after normal ordering (up to round-off).
+            """
+            vec = np.zeros(self.size, dtype=dtype)
+
+            norm_op = of.transforms.normal_ordered(opr)
+
+            for term, coeff in norm_op.terms.items():
+
+                if abs(coeff) <= tol:
+                    continue                                    # too small
+
+                # ensure “creation only’’  (cd = 1)  otherwise not in this basis
+                if any(cd != 1 for _, cd in term):
+                    raise ValueError(
+                        f"term {term} contains annihilation operator; "
+                        "basis is creation strings only")
+
+                # build bit mask
+                mask = 0
+                for i, _ in term:
+                    mask |= 1 << i
+
+                idx = self._mask2idx.get(mask)
+                if idx is None:
+                    if allow_missing:
+                        continue
+                    raise ValueError(f"term {term} not contained in the basis")
+
+                vec[idx] += coeff
+
+            return vec
+
+    def vec_to_op(self, vec: np.ndarray) -> of.FermionOperator:
+        op = of.FermionOperator()
+        for idx, coeff in enumerate(vec):
+            if coeff != 0:
+                op += coeff * self.base[idx]
+        return of.transforms.normal_ordered(op)
+
+
     # ---------------------------------------------------------------------
     # static shortcuts
     # ---------------------------------------------------------------------

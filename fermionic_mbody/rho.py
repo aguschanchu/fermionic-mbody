@@ -125,7 +125,7 @@ def _block_worker(
     """
     Worker that fills the *pair-scattering* block
 
-        c†_k  c†_{\bar l}  c_{\bar k}  c_l
+        c†_k  c†_{\bar l}  c_{\bar j}  c_i
 
     used e.g. in BCS-like Hamiltonians.
     """
@@ -144,6 +144,7 @@ def _block_worker(
             k, l = divmod(int(idx2), m_pairs)
             op1 = of.FermionOperator(((2 * k, 1), (2 * l + 1, 1)))
 
+            op = op1 * op2
             mat = number_preserving_matrix(op, basis.d, basis.num)
 
             rows, cols = mat.nonzero()
@@ -212,6 +213,7 @@ def _kkbar_worker(
             jj = int(jj)  # pair index for the *column*
             op1 = of.FermionOperator(((2 * jj, 1), (2 * jj + 1, 1)))
 
+            op = op1 * op2
             mat = number_preserving_matrix(op, basis.d, basis.num)
 
             rows, cols = mat.nonzero()
