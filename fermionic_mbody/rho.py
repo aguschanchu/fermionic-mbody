@@ -24,6 +24,7 @@ from ._ofsparse import number_preserving_matrix, restrict_sector_matrix
 __all__ = [
     "rho_m_gen",
     "rho_2_block_gen",
+    "antisymmetrise_block",
     "rho_2_kkbar_gen",
     "rho_m",
 ]
@@ -154,7 +155,6 @@ def _block_worker(
 
     return indices, values
 
-
 # .....................................................................
 def rho_2_block_gen(basis: FixedBasis, *, n_workers: int | None = None) -> sparse.COO:
     """
@@ -189,6 +189,36 @@ def rho_2_block_gen(basis: FixedBasis, *, n_workers: int | None = None) -> spars
     coords = np.asarray(idx_list).T
     return sparse.COO(coords, val_list, shape=shape)
 
+# .....................................................................
+def antisymmetrise_block(rho: sparse.COO) -> sparse.COO:
+    """
+    Project the ordered block ρ₂[i j , k l] onto the antisymmetric subspace
+    and return ρ̄₂[ i<j , k<l ].
+    """
+    # infer the number of pairs from the size of the first index
+    m_pairs = int(round(np.sqrt(rho.shape[0])))
+    if m_pairs * m_pairs != rho.shape[0]:
+        raise ValueError("ρ has not the expected shape (m², m², …)")
+
+    # ---------------------------------------------------------------------
+    # build the antisymmetriser  P  (same code as before)
+    pairs = [(i, j) for i in range(m_pairs) for j in range(i + 1, m_pairs)]
+    n_pairs = len(pairs)
+
+    rows, cols, data = [], [], []
+    for r, (i, j) in enumerate(pairs):
+        rows.extend([r, r])
+        cols.extend([i * m_pairs + j, j * m_pairs + i])
+        data.extend([+1 / np.sqrt(2), -1 / np.sqrt(2)])
+
+    P = sparse.COO(np.vstack([rows, cols]), data,
+                   shape=(n_pairs, m_pairs ** 2))
+
+    # ---------------------------------------------------------------------
+    # ρ̄₂ = P · ρ₂ · Pᵀ
+    tmp = sparse.tensordot(P, rho, axes=(1, 0))       # P · ρ
+    rho_bar = sparse.tensordot(tmp, P.T, axes=(1, 0)) # … · Pᵀ
+    return rho_bar
 
 # ---------------------------------------------------------------------
 # ρ₂ *k \bar k* diagonal block
