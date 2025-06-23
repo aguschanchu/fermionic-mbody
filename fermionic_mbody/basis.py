@@ -272,6 +272,35 @@ class FixedBasis:
         new.signs    = new._signs_gen()
         return new
 
+    # ---------------------------------------------------------------------
+    # convenience erialization hooks
+    # ---------------------------------------------------------------------
+    def __getstate__(self) -> dict:
+        """
+        Return a *small* dict that is safe to send to Ray workers.
+        """
+        return {"d": self.d, "num": self.num, "pairs": self.pairs}
+
+    def __setstate__(self, state: dict) -> None:
+        """Rebuild heavy caches locally after unpickling."""
+        self.d     = state["d"]
+        self.num   = state["num"]
+        self.pairs = state["pairs"]
+        # rebuild every cache the same way __post_init__ does
+        self.base, self.num_ele = self._create_basis()
+        self.size      = len(self.base)
+        self.canonicals = np.eye(self.size)
+        self.signs     = self._signs_gen()
+
+    @classmethod
+    def from_state(cls, state: dict) -> "FixedBasis":
+        """
+        Recreate a FixedBasis from the output of __getstate__ without
+        calling the regular __init__ (avoids double work when unpickling).
+        """
+        obj = cls.__new__(cls)  # bypass __init__
+        obj.__setstate__(state)
+        return obj
 
     # ---------------------------------------------------------------------
     # convenience FermionOperator factories
