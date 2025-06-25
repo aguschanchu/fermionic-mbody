@@ -16,10 +16,13 @@ import numpy as np
 import openfermion as of
 import sparse
 from multiprocessing import cpu_count
+from math import comb
+from functools import wraps
 
 from ._parallel import chunked
 from .basis import FixedBasis
-from ._ofsparse import number_preserving_matrix, restrict_sector_matrix
+from ._ofsparse import number_preserving_matrix, restrict_sector_matrix, mask_to_index_map
+
 
 __all__ = [
     "rho_m_gen",
@@ -36,6 +39,47 @@ __all__ = [
 def _ensure_workers(n_workers: int | None) -> int:
     """Return a strictly positive worker count (defaults to all CPUs)."""
     return max(1, n_workers or cpu_count())
+
+
+def _restrict_last2(tensor, subset):
+    """
+    Keep rows/cols whose *full-sector* positions are listed in `subset`
+    (1-D int array).  Works for any tensor whose last two axes are the
+    N-body basis.
+
+    Implementation detail: slice **one axis at a time** so we never pass
+    more than one advanced index to sparse.COO.
+    """
+    subset = np.asarray(subset)
+
+    # 1) cut the **last** axis: …, full_dim  ->  …, k
+    tensor = tensor[(Ellipsis, subset)]             # ⇢ shape (..., full, k)
+
+    # 2) cut what is now the **penultimate** axis (was full_dim)
+    #    build an index tuple like  (..., subset, :)
+    nd  = tensor.ndim
+    idx = [slice(None)] * (nd - 2) + [subset, slice(None)]
+    return tensor[tuple(idx)]                       # ⇢ shape (..., k, k)
+    
+
+def subspace_aware(gen_fn):
+    """Make a ρ-generator work with restricted FixedBasis objects."""
+    @wraps(gen_fn)
+    def wrapper(basis, *args, **kw):
+        full_dim = comb(basis.d, basis.num)
+        if basis.size == full_dim:                 # full sector → original path
+            return gen_fn(basis, *args, **kw)
+
+        # --- expand to full sector -------------------------------------------------
+        from .basis import FixedBasis             # lazy import to avoid cycles
+        tensor_full = gen_fn(FixedBasis(basis.d, basis.num), *args, **kw)
+
+        # --- slice it back ---------------------------------------------------------
+        mapping = mask_to_index_map(basis.d, basis.num)
+        subset  = np.fromiter((mapping[m] for m in basis.num_ele), int)
+        return _restrict_last2(tensor_full, subset)
+    return wrapper
+
 
 # ---------------------------------------------------------------------
 # generic ρ(m) tensor
@@ -72,6 +116,7 @@ def _process_m_chunk(
 
 
 # .....................................................................
+@subspace_aware
 def rho_m_gen(
     basis: FixedBasis, m: int, *, n_workers: int | None = None
 ) -> sparse.COO:
@@ -156,6 +201,7 @@ def _block_worker(
     return indices, values
 
 # .....................................................................
+@subspace_aware
 def rho_2_block_gen(basis: FixedBasis, *, n_workers: int | None = None) -> sparse.COO:
     """
     Generate the *pair-scattering* block
@@ -255,6 +301,7 @@ def _kkbar_worker(
 
 
 # .....................................................................
+@subspace_aware
 def rho_2_kkbar_gen(basis: FixedBasis, *, n_workers: int | None = None) -> sparse.COO:
     """
     Generate the diagonal *k \\bar k* block
