@@ -197,7 +197,19 @@ class FixedBasis:
     def m(self) -> Optional[int]:
         """Alias for *num* (kept for backward-compatibility)."""
         return self.num
-
+    
+    @staticmethod
+    def _det2op(det: int, n_qubits: int) -> of.FermionOperator:
+        """
+        Convert an integer det into the
+        corresponding creation-operator string |vac⟩ → |det⟩
+        """
+        op = of.FermionOperator(())            # start with vacuum |0>
+        for q in range(n_qubits):
+            if (det >> q) & 1:              # bit q is occupied?
+                op *= of.FermionOperator(((q, 1),))   # a†_q
+        return op
+    
     # ---------------------------------------------------------------------
     # internal machinery
     # ---------------------------------------------------------------------
@@ -279,15 +291,17 @@ class FixedBasis:
         """
         Return a *small* dict that is safe to send to Ray workers.
         """
-        return {"d": self.d, "num": self.num, "pairs": self.pairs}
+        return {"d": self.d, "num": self.num, "pairs": self.pairs, 'num_ele': self.num_ele}
 
     def __setstate__(self, state: dict) -> None:
         """Rebuild heavy caches locally after unpickling."""
         self.d     = state["d"]
         self.num   = state["num"]
         self.pairs = state["pairs"]
+        self.num_ele = np.asarray(state["num_ele"], dtype=np.int64)
+
         # rebuild every cache the same way __post_init__ does
-        self.base, self.num_ele = self._create_basis()
+        self.base   = [self._det2op(det, self.d) for det in self.num_ele]
         self.size      = len(self.base)
         self.canonicals = np.eye(self.size)
         self.signs     = self._signs_gen()
