@@ -6,7 +6,8 @@ the API works for different d.
 import numpy as np
 
 from fermionic_mbody import FixedBasis, rho_m, rho_m_gen
-from tests.conftest import dense
+from .helpers import dense, pair_condensate_state
+
 
 def test_spectral_twin_identity():
     basis = FixedBasis(d=6, num=3)      # N = 3

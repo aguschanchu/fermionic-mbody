@@ -13,8 +13,7 @@ subspace.
 import numpy as np
 
 from fermionic_mbody import FixedBasis, rho_m, rho_m_gen, rho_2_kkbar_gen
-from tests.conftest import dense, slater_state
-
+from .helpers import dense, pair_condensate_state, slater_state
 
 def test_rho2_kkbar_row_sum_matches_rho1_diag():
     # Basis with pair compression ON

@@ -4,7 +4,8 @@ Every reduced density matrix must be Hermitian.
 import numpy as np
 
 from fermionic_mbody import rho_m
-from tests.conftest import dense
+from .helpers import dense
+
 
 def test_rho1_hermitian(basis_4_2, rho1_tensor):
     psi = np.random.default_rng(1).normal(size=basis_4_2.size) + 0j

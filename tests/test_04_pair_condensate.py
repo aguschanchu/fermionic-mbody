@@ -5,7 +5,8 @@ import math
 import numpy as np
 
 from fermionic_mbody import rho_m
-from tests.conftest import dense
+from .helpers import dense
+
 
 def test_pair_condensate_occupancies(basis_4_2, rho1_tensor, random_state):
     n_pairs = basis_4_2.d // 2

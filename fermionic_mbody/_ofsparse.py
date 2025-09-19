@@ -119,7 +119,7 @@ def number_preserving_matrix(op: of.FermionOperator,
     ref_det = np.array([i < n for i in range(d)], dtype=bool)
     states  = np.asarray(
         list(_iterate_basis_(ref_det, n, spin_preserving)))
-    bitmasks = states.dot(1 << np.arange(d)[::-1])
+    bitmasks = states.dot(1 << np.arange(d)[::1])
     order = np.argsort(bitmasks)
 
     return mat[order][:, order]

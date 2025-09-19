@@ -4,7 +4,7 @@ Projector-like properties that characterise Slater determinants.
 import numpy as np
 
 from fermionic_mbody import rho_m
-from tests.conftest import dense
+from .helpers import dense
 
 def test_rho1_is_projector(basis_4_2, rho1_tensor):
     # Slater determinant |1100⟩
