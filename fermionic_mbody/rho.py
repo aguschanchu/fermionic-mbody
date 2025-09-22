@@ -35,6 +35,7 @@ __all__ = [
     "rho_m",
 ]
 
+USE_NUMBA = True
 
 # ---------------------------------------------------------------------
 # helpers
@@ -96,7 +97,6 @@ def subspace_aware(gen_fn):
 @njit(cache=True)
 def popcount(n):
     """Fast population count (number of set bits) using Numba."""
-    # Brian Kernighan's algorithm, optimized by Numba/LLVM.
     count = 0
     n = int(n) # Ensure integer type
     while n > 0:
@@ -132,49 +132,56 @@ def calculate_fermionic_sign_numba(mask_c, indices_i: np.ndarray):
 @njit(cache=True)
 def compute_rdm_contributions_numba(ii_arr, c_idx_arr, sign_arr, coord_dtype_np):
     """
-    Numba-accelerated core loop for RDM calculation.
-    Computes contributions T_ij(c_j, c_i) = sign_i * sign_j for a specific r_idx.
+    Numba-accelerated core loop using pre-allocation.
     """
     num_conn = len(ii_arr)
-    # Accumulate results in lists (supported by Numba)
-    indices_list = []
-    values_list = []
+    
+    if num_conn == 0:
+        return np.empty((0, 4), dtype=coord_dtype_np), np.empty(0, dtype=np.float64)
 
+    # 1. Calculate required size and pre-allocate.
+    # The total number of entries generated when covering jj >= ii and adding symmetry (jj, ii)
+    # is exactly num_conn * num_conn.
+    total_size = num_conn * num_conn
+    
+    indices_np = np.empty((total_size, 4), dtype=coord_dtype_np)
+    values_np = np.empty(total_size, dtype=np.float64) # Values are always float
+
+    k = 0 # Counter for the current position in the output arrays
+
+    # 2. Fill the arrays efficiently
     for i in range(num_conn):
         ii = ii_arr[i]
         c_idx_i = c_idx_arr[i]
         sign_i = sign_arr[i]
         
-        for j in range(num_conn):
+        # Iterate starting from i to only cover jj >= ii
+        for j in range(i, num_conn):
             jj = ii_arr[j]
+            c_idx_j = c_idx_arr[j]
+            sign_j = sign_arr[j]
+
+            value = float(sign_i * sign_j)
             
-            # Exploit Hermiticity (only calculate jj >= ii)
-            if jj >= ii:
-                c_idx_j = c_idx_arr[j]
-                sign_j = sign_arr[j]
+            # Store (ii, jj) part: [ii, jj, c_idx_j, c_idx_i]
+            indices_np[k, 0] = ii
+            indices_np[k, 1] = jj
+            indices_np[k, 2] = c_idx_j
+            indices_np[k, 3] = c_idx_i
+            values_np[k] = value
+            k += 1
 
-                value = float(sign_i * sign_j)
-                
-                # Store coordinates [ii, jj, c_idx_j, c_idx_i]
-                # Numba requires explicit dtype for arrays created inside
-                coords = np.array([[ii, jj, c_idx_j, c_idx_i]], dtype=coord_dtype_np)
-                indices_list.append(coords)
-                values_list.append(np.array([value]))
+            # Add the symmetric part (jj, ii) if i != j
+            if i != j:
+                # Store (jj, ii) part: [jj, ii, c_idx_i, c_idx_j]
+                indices_np[k, 0] = jj
+                indices_np[k, 1] = ii
+                indices_np[k, 2] = c_idx_i
+                indices_np[k, 3] = c_idx_j
+                values_np[k] = value # Value is real
+                k += 1
 
-                # Add the symmetric part if ii != jj
-                if ii != jj:
-                    coords_sym = np.array([[jj, ii, c_idx_i, c_idx_j]], dtype=coord_dtype_np)
-                    indices_list.append(coords_sym)
-                    values_list.append(np.array([value]))
-
-    # Handle empty results
-    if not indices_list:
-        # Return correctly typed empty arrays
-        return np.empty((0, 4), dtype=coord_dtype_np), np.empty(0, dtype=np.float64)
-
-    # Concatenation is supported in Numba
-    indices_np = np.concatenate(indices_list, axis=0)
-    values_np = np.concatenate(values_list, axis=0)
+    # Return the filled arrays.
     return indices_np, values_np
 
 # ---------------------------------------------------------------------
@@ -261,7 +268,7 @@ def _process_chunk_connections_v3(args):
     # Get the actual numpy type object for Numba compatibility
     coord_dtype_np = np.dtype(coord_dtype).type
 
-    # Accumulate results locally
+    # Accumulate results locally (Python level, outside JIT scope)
     indices_list = []
     values_list = []
 
@@ -290,10 +297,11 @@ def _process_chunk_connections_v3(args):
 
         # Call optimized function
         if USE_NUMBA:
+            # Call the corrected Numba function (using pre-allocation)
             indices_np, values_np = compute_rdm_contributions_numba(
                 ii_arr, c_idx_arr, sign_arr, coord_dtype_np)
         else:
-            # Fallback to Python version if Numba is disabled.
+            # Fallback to Python version (which now also uses pre-allocation)
             # We access the original Python function underlying the Numba wrapper.
             indices_np, values_np = compute_rdm_contributions_numba.py_func(
                  ii_arr, c_idx_arr, sign_arr, coord_dtype_np)
@@ -303,7 +311,7 @@ def _process_chunk_connections_v3(args):
             indices_list.append(indices_np)
             values_list.append(values_np)
 
-    # Concatenate results before returning
+    # Concatenate results before returning (This happens outside Numba JIT scope)
     if not indices_list:
         return np.empty((0, 4), dtype=coord_dtype), np.empty(0, dtype=float)
         
@@ -320,7 +328,7 @@ def rho_m_gen(
     basis: FixedBasis, m: int, *, n_workers: int | None = None
 ) -> sparse.COO:
     """
-    Build the sparse ρ(m) tensor (V3: Direct Connection Mapping with Numba Acceleration).
+    Build the sparse ρ(m) tensor (V3.1: Direct Connection Mapping with Numba Acceleration).
     """
     if basis.num is None:
          raise ValueError("basis.num must be set for RDM generation.")
@@ -343,15 +351,15 @@ def rho_m_gen(
         eye = sp_sparse.eye(D_N, dtype=float)
         return sparse.COO(eye).reshape((1, 1, D_N, D_N))
 
-    # Pre-calculate indices for basis_N (Optimization for subset iteration)
-    basis_N_indices = {}
-    for mask_c in basis_N.num_ele:
+    # Pre-calculate indices for basis (Optimization for subset iteration)
+    basis_indices = {}
+    for mask_c in basis.num_ele:
         # Ensure indices are sorted (required for correct sign calculation)
-        basis_N_indices[mask_c] = sorted([i for i in range(basis.d) if (mask_c >> i) & 1])
+        basis_indices[mask_c] = sorted([i for i in range(basis.d) if (mask_c >> i) & 1])
 
     # 1. Calculate connections (Sequential, optimized with Numba signs if available)
     connections, mask2idx_Nm, sorted_Nm_masks = calculate_connections_v3(
-        basis, m_basis, basis.d, basis_N_indices)
+        basis, m_basis, basis.d, basis_indices)
     
     D_Nm = len(sorted_Nm_masks)
     if D_Nm == 0:
@@ -378,7 +386,7 @@ def rho_m_gen(
     iterable = [(list(chunk), connections, D_m, coord_dtype) 
                 for chunk in chunks if len(chunk) > 0]
 
-    description = f"ρ_{m} (V3 Numba)" if USE_NUMBA else f"ρ_{m} (V3 Python)"
+    description = f"ρ_{m} (V3.1 Numba)" if USE_NUMBA else f"ρ_{m} (V3.1 Python)"
     results = chunked(
         _process_chunk_connections_v3,
         iterable,
