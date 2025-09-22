@@ -18,6 +18,8 @@ import sparse
 from multiprocessing import cpu_count
 from math import comb
 from functools import wraps
+import numba
+from numba import njit
 
 from ._parallel import chunked
 from .basis import FixedBasis
@@ -26,6 +28,7 @@ from ._ofsparse import number_preserving_matrix, restrict_sector_matrix, mask_to
 
 __all__ = [
     "rho_m_gen",
+    "rho_m_gen_legacy",   
     "rho_2_block_gen",
     "antisymmetrise_block",
     "rho_2_kkbar_gen",
@@ -81,8 +84,328 @@ def subspace_aware(gen_fn):
     return wrapper
 
 
+
+# =====================================================================
+# OPTIMIZED RHO_M_GEN IMPLEMENTATION (Numba acceleration)
+# =====================================================================
+
 # ---------------------------------------------------------------------
-# generic ρ(m) tensor
+# Numba Optimized Helper Functions
+# ---------------------------------------------------------------------
+
+@njit(cache=True)
+def popcount(n):
+    """Fast population count (number of set bits) using Numba."""
+    # Brian Kernighan's algorithm, optimized by Numba/LLVM.
+    count = 0
+    n = int(n) # Ensure integer type
+    while n > 0:
+        n &= (n - 1) 
+        count += 1
+    return count
+
+@njit(cache=True)
+def calculate_fermionic_sign_numba(mask_c, indices_i: np.ndarray):
+    """
+    Calculates the fermionic sign (Jordan-Wigner, LE convention) using Numba.
+    indices_i must be a sorted numpy array.
+    """
+    sign = 1
+    current_mask = mask_c
+    
+    # Apply operators sequentially (lowest index first)
+    for idx in indices_i:
+        # 1. Calculate sign based on parity of electrons before idx
+        mask_before = (1 << idx) - 1
+        
+        # Use optimized popcount
+        count = popcount(current_mask & mask_before)
+            
+        if (count & 1) == 1: # Check parity (if odd)
+            sign = -sign
+            
+        # 2. Update the mask (annihilate electron at idx)
+        current_mask ^= (1 << idx)
+        
+    return sign
+
+@njit(cache=True)
+def compute_rdm_contributions_numba(ii_arr, c_idx_arr, sign_arr, coord_dtype_np):
+    """
+    Numba-accelerated core loop for RDM calculation.
+    Computes contributions T_ij(c_j, c_i) = sign_i * sign_j for a specific r_idx.
+    """
+    num_conn = len(ii_arr)
+    # Accumulate results in lists (supported by Numba)
+    indices_list = []
+    values_list = []
+
+    for i in range(num_conn):
+        ii = ii_arr[i]
+        c_idx_i = c_idx_arr[i]
+        sign_i = sign_arr[i]
+        
+        for j in range(num_conn):
+            jj = ii_arr[j]
+            
+            # Exploit Hermiticity (only calculate jj >= ii)
+            if jj >= ii:
+                c_idx_j = c_idx_arr[j]
+                sign_j = sign_arr[j]
+
+                value = float(sign_i * sign_j)
+                
+                # Store coordinates [ii, jj, c_idx_j, c_idx_i]
+                # Numba requires explicit dtype for arrays created inside
+                coords = np.array([[ii, jj, c_idx_j, c_idx_i]], dtype=coord_dtype_np)
+                indices_list.append(coords)
+                values_list.append(np.array([value]))
+
+                # Add the symmetric part if ii != jj
+                if ii != jj:
+                    coords_sym = np.array([[jj, ii, c_idx_i, c_idx_j]], dtype=coord_dtype_np)
+                    indices_list.append(coords_sym)
+                    values_list.append(np.array([value]))
+
+    # Handle empty results
+    if not indices_list:
+        # Return correctly typed empty arrays
+        return np.empty((0, 4), dtype=coord_dtype_np), np.empty(0, dtype=np.float64)
+
+    # Concatenation is supported in Numba
+    indices_np = np.concatenate(indices_list, axis=0)
+    values_np = np.concatenate(values_list, axis=0)
+    return indices_np, values_np
+
+# ---------------------------------------------------------------------
+# Python Helper Functions (Used if Numba is disabled or for setup)
+# ---------------------------------------------------------------------
+
+def calculate_fermionic_sign_python(mask_c: int, indices_i: Sequence[int]) -> int:
+    """Pure Python fermionic sign calculation (Fallback)."""
+    sign = 1
+    current_mask = mask_c
+    for idx in indices_i:
+        mask_before = (1 << idx) - 1
+        # Use optimized population count if available (Python 3.10+)
+        if hasattr(int, 'bit_count'):
+            count = (current_mask & mask_before).bit_count()
+        else:
+            count = bin(current_mask & mask_before).count('1')
+
+        if (count & 1) == 1:
+            sign = -sign
+        current_mask ^= (1 << idx)
+    return sign
+
+def calculate_connections_v3(basis_N: FixedBasis, m_basis: FixedBasis, d: int, basis_N_indices: Dict[int, List[int]]):
+    """
+    Calculates the connection map using optimized subset iteration.
+    Uses Numba signs if available.
+    """
+    N = basis_N.num
+    if N is None: return {}, {}, []
+    m = m_basis.num
+    mask2idx_m = m_basis._mask2idx
+
+    # Pass 1: Identify Nm_masks (Python loop, optimized by subset iteration)
+    Nm_masks = set()
+    for mask_c in basis_N.num_ele:
+        indices_c = basis_N_indices[mask_c]
+        # Iterate over all combinations of size m (subsets)
+        for indices_i in itertools.combinations(indices_c, m):
+            mask_i = 0
+            for idx in indices_i:
+                mask_i |= (1 << idx)
+            
+            if mask_i in mask2idx_m:
+                Nm_masks.add(mask_c ^ mask_i)
+
+    # Create mapping for (N-m) subspace (LE ascending order)
+    sorted_Nm_masks = sorted(list(Nm_masks))
+    mask2idx_Nm = {mask: idx for idx, mask in enumerate(sorted_Nm_masks)}
+    
+    # Pass 2: Calculate connections
+    connections = {}
+    for c_idx, mask_c in enumerate(basis_N.num_ele):
+        indices_c = basis_N_indices[mask_c]
+        
+        for indices_i_tuple in itertools.combinations(indices_c, m):
+            mask_i = 0
+            for idx in indices_i_tuple:
+                mask_i |= (1 << idx)
+            
+            if mask_i in mask2idx_m:
+                ii = mask2idx_m[mask_i]
+                mask_r = mask_c ^ mask_i
+                r_idx = mask2idx_Nm[mask_r]
+                
+                # Calculate sign (Use Numba if available)
+                if USE_NUMBA:
+                    # Numba function expects numpy array (use int64 for safety)
+                    indices_i_np = np.array(indices_i_tuple, dtype=np.int64)
+                    sign = calculate_fermionic_sign_numba(mask_c, indices_i_np)
+                else:
+                    sign = calculate_fermionic_sign_python(mask_c, indices_i_tuple)
+                
+                connections[(r_idx, ii)] = (c_idx, sign)
+    
+    return connections, mask2idx_Nm, sorted_Nm_masks
+
+def _process_chunk_connections_v3(args):
+    """
+    Worker utilizing Numba for the core computation loop (if available).
+    """
+    r_indices_chunk, connections, D_m, coord_dtype = args
+    
+    # Get the actual numpy type object for Numba compatibility
+    coord_dtype_np = np.dtype(coord_dtype).type
+
+    # Accumulate results locally
+    indices_list = []
+    values_list = []
+
+    # Iterate over intermediate states r
+    for r_idx in r_indices_chunk:
+        # Collect connections passing through this r_idx
+        # Convert data structure from Dict to NumPy arrays for Numba/Optimized Python
+        ii_list, c_idx_list, sign_list = [], [], []
+        
+        # This iteration is O(D_m)
+        for ii in range(D_m):
+            key = (r_idx, ii)
+            if key in connections:
+                c_idx, sign = connections[key]
+                ii_list.append(ii)
+                c_idx_list.append(c_idx)
+                sign_list.append(sign)
+        
+        if not ii_list:
+            continue
+            
+        # Prepare arrays
+        ii_arr = np.array(ii_list, dtype=coord_dtype_np)
+        c_idx_arr = np.array(c_idx_list, dtype=coord_dtype_np)
+        sign_arr = np.array(sign_list, dtype=np.int8) # Signs are +1/-1
+
+        # Call optimized function
+        if USE_NUMBA:
+            indices_np, values_np = compute_rdm_contributions_numba(
+                ii_arr, c_idx_arr, sign_arr, coord_dtype_np)
+        else:
+            # Fallback to Python version if Numba is disabled.
+            # We access the original Python function underlying the Numba wrapper.
+            indices_np, values_np = compute_rdm_contributions_numba.py_func(
+                 ii_arr, c_idx_arr, sign_arr, coord_dtype_np)
+
+        
+        if indices_np.size > 0:
+            indices_list.append(indices_np)
+            values_list.append(values_np)
+
+    # Concatenate results before returning
+    if not indices_list:
+        return np.empty((0, 4), dtype=coord_dtype), np.empty(0, dtype=float)
+        
+    indices_np = np.concatenate(indices_list, axis=0)
+    values_np = np.concatenate(values_list, axis=0)
+    
+    return indices_np, values_np
+
+# ---------------------------------------------------------------------
+# generic ρ(m) tensor (Main function)
+# ---------------------------------------------------------------------
+
+def rho_m_gen(
+    basis: FixedBasis, m: int, *, n_workers: int | None = None
+) -> sparse.COO:
+    """
+    Build the sparse ρ(m) tensor (V3: Direct Connection Mapping with Numba Acceleration).
+    """
+    if basis.num is None:
+         raise ValueError("basis.num must be set for RDM generation.")
+    if chunked is None:
+         raise ImportError("rho_m_gen requires the _parallel module.")
+
+         
+    # Ensure m_basis respects the same structure/restrictions if applicable
+    m_basis = FixedBasis(basis.d, num=m, pairs=basis.pairs) 
+    
+    D_N = basis.size
+    D_m = m_basis.size
+    shape = (D_m, D_m, D_N, D_N)
+
+    # Handle edge cases
+    if m > basis.num or basis.num == 0 or m < 0:
+        return sparse.COO([], [], shape=shape)
+        
+    if m == 0:
+        eye = sp_sparse.eye(D_N, dtype=float)
+        return sparse.COO(eye).reshape((1, 1, D_N, D_N))
+
+    # Pre-calculate indices for basis_N (Optimization for subset iteration)
+    basis_N_indices = {}
+    for mask_c in basis_N.num_ele:
+        # Ensure indices are sorted (required for correct sign calculation)
+        basis_N_indices[mask_c] = sorted([i for i in range(basis.d) if (mask_c >> i) & 1])
+
+    # 1. Calculate connections (Sequential, optimized with Numba signs if available)
+    connections, mask2idx_Nm, sorted_Nm_masks = calculate_connections_v3(
+        basis, m_basis, basis.d, basis_N_indices)
+    
+    D_Nm = len(sorted_Nm_masks)
+    if D_Nm == 0:
+        return sparse.COO([], [], shape=shape)
+
+    # Memory Optimization: Determine optimal integer type
+    max_dim = max(D_m, D_N)
+    if max_dim <= np.iinfo(np.int16).max:
+        coord_dtype = np.int16 # Sufficient for d=12
+    elif max_dim <= np.iinfo(np.int32).max:
+        coord_dtype = np.int32
+    else:
+        coord_dtype = np.int64
+
+    # 2. Parallel computation (Multiprocessing + Numba workers)
+    n_workers = _ensure_workers(n_workers)
+    
+    r_indices = np.arange(D_Nm)
+    # Using more chunks improves load balancing
+    num_chunks = max(n_workers * 8, 1) 
+    chunks = np.array_split(r_indices, num_chunks)
+    
+    # Prepare iterable. 
+    iterable = [(list(chunk), connections, D_m, coord_dtype) 
+                for chunk in chunks if len(chunk) > 0]
+
+    description = f"ρ_{m} (V3 Numba)" if USE_NUMBA else f"ρ_{m} (V3 Python)"
+    results = chunked(
+        _process_chunk_connections_v3,
+        iterable,
+        n_workers=n_workers,
+        description=description,
+    )
+
+    # 3. Merge results
+    idx_chunks = []
+    val_chunks = []
+    for idx_np, val_np in results:
+        if idx_np.size > 0:
+            idx_chunks.append(idx_np)
+            val_chunks.append(val_np)
+
+    if not idx_chunks:
+        return sparse.COO([], [], shape=shape)
+
+    # Final concatenation
+    coords_T = np.concatenate(idx_chunks, axis=0).T
+    data = np.concatenate(val_chunks, axis=0)
+    
+    # sparse.COO handles duplicate coordinates by summing them (required by this approach).
+    return sparse.COO(coords_T, data, shape=shape)
+
+# ---------------------------------------------------------------------
+# legacy generic ρ(m) tensor
 # ---------------------------------------------------------------------
 def _process_m_chunk(
     args: Tuple[np.ndarray, FixedBasis, FixedBasis]
@@ -117,7 +440,7 @@ def _process_m_chunk(
 
 # .....................................................................
 @subspace_aware
-def rho_m_gen(
+def rho_m_gen_legacy(
     basis: FixedBasis, m: int, *, n_workers: int | None = None
 ) -> sparse.COO:
     """
