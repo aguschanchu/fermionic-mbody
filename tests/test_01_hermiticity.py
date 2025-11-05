@@ -8,7 +8,7 @@ from fermionic_mbody import rho_m
 from .helpers import dense
 
 
-def test_rho1_hermitian(basis_4_2, rho1_tensor):
+def test_rho1_hermitian(basis_4_2, rho1_tensor, random_state):
     # Use complex state to rigorously test R = R†
     psi = random_state(basis_4_2, seed=1, use_complex=True)
 
@@ -16,7 +16,7 @@ def test_rho1_hermitian(basis_4_2, rho1_tensor):
     assert np.allclose(rho1, rho1.conj().T)
 
 
-def test_rho2_hermitian(basis_4_2, rho2_tensor):
+def test_rho2_hermitian(basis_4_2, rho2_tensor, random_state):
     psi = random_state(basis_4_2, seed=1, use_complex=True)
 
     rho2 = dense(rho_m(psi, rho2_tensor))

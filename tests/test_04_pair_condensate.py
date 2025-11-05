@@ -13,8 +13,6 @@ def test_pair_condensate_occupancies(basis_4_2, rho1_tensor, random_state):
     m_pairs = 1
     expected_occupancy = m_pairs / n_pairs     # = 0.5
 
-    from tests.conftest import pair_condensate_state
-
     psi = get_pair_condensate(basis_4_2, m_pairs)
     rho1 = dense(rho_m(psi, rho1_tensor))
 
@@ -23,7 +21,6 @@ def test_pair_condensate_occupancies(basis_4_2, rho1_tensor, random_state):
 
 
 def test_pair_condensate_lambda_max(basis_4_2, rho2_tensor):
-    from tests.conftest import pair_condensate_state
 
     m_pairs = 1
     n_pairs = basis_4_2.d // 2

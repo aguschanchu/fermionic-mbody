@@ -67,7 +67,9 @@ def test_contraction_identity_rho2_to_rho1(random_state):
                 # The signs are implicitly handled by the FixedBasis ordering 
                 # consistency between M=1 and M=2 bases.
                 # Contribution: RDM1[i, j] += RDM2[I, J]
-                RDM1_contracted[i_idx, j_idx] += RDM2[I_idx, J_idx]
+                s_i = +1 if i_idx < k_idx else -1
+                s_j = +1 if j_idx < k_idx else -1
+                RDM1_contracted[i_idx, j_idx] += (s_i * s_j) * RDM2[I_idx, J_idx]
 
     # Apply the normalization factor (N-1)
     RDM1_contracted /= (N - 1)

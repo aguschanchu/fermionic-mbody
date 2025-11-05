@@ -8,7 +8,7 @@ import pytest
 from fermionic_mbody import rho_m
 from .helpers import dense, get_slater_determinant
 
-def test_rho_m_trace(basis_4_2, rho1_tensor, rho2_tensor):
+def test_rho_m_trace(basis_4_2, rho1_tensor, rho2_tensor, random_state):
     N = basis_4_2.num
 
     # random pure state
@@ -23,7 +23,7 @@ def test_rho_m_trace(basis_4_2, rho1_tensor, rho2_tensor):
     assert np.isclose(np.trace(rho2), math.comb(N, 2))  # Tr ρ₂ = C(N,2)
 
 
-def test_number_operator_identity(basis_4_2, rho1_tensor):
+def test_number_operator_identity(basis_4_2, rho1_tensor, random_state):
     N = basis_4_2.num
     psi = get_slater_determinant(basis_4_2, (0, 1))
 
