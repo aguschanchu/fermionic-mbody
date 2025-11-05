@@ -19,6 +19,7 @@ from math import comb
 from functools import wraps
 import numba
 from numba import njit
+from scipy import sparse as sp_sparse
 
 from ._parallel import chunked
 from .basis import FixedBasis
@@ -32,6 +33,7 @@ __all__ = [
     "antisymmetrise_block",
     "rho_2_kkbar_gen",
     "rho_m",
+    "rho_m_direct",
 ]
 
 USE_NUMBA = True
@@ -724,13 +726,12 @@ def rho_m(state: np.ndarray, rho_arrays: sparse.COO) -> sparse.COO:
 # =====================================================================
 
 @njit(cache=True)
-def compute_outer_product_contribution_numba(partial_rdm, ii_arr, V_r_arr):
+def compute_outer_product_contribution(partial_rdm, ii_arr, V_r_arr, is_complex: bool):
     """
     Numba-accelerated calculation of outer product contribution to RDM.
     Updates partial_rdm in place: RDM += V_r^\dagger @ V_r
     """
     n = len(ii_arr)
-    is_complex = partial_rdm.dtype.kind == 'c'
 
     # Pre-calculate conjugation
     conj_V_r_arr = np.conj(V_r_arr)
@@ -767,8 +768,10 @@ def _process_chunk_direct_rdm(args):
     # Determine dtype for the RDM, ensuring sufficient precision.
     if psi.dtype.kind == 'c':
         rdm_dtype = np.complex128 if np.dtype(psi.dtype).itemsize < 16 else psi.dtype
+        is_complex = True
     else:
         rdm_dtype = np.float64 if np.dtype(psi.dtype).itemsize < 8 else psi.dtype
+        is_complex = False
 
     # Initialize partial RDM matrix for this chunk
     partial_rdm = np.zeros((D_m, D_m), dtype=rdm_dtype)
@@ -799,16 +802,7 @@ def _process_chunk_direct_rdm(args):
         ii_arr = np.array(ii_list, dtype=np.int64) # Indices
         V_r_arr = np.array(V_r_elements, dtype=rdm_dtype)
         
-        # Calculate outer product contribution and add to partial_rdm
-        if USE_NUMBA:
-            compute_outer_product_contribution_numba(partial_rdm, ii_arr, V_r_arr)
-        else:
-            # Python fallback
-            try:
-                compute_outer_product_contribution_numba.py_func(partial_rdm, ii_arr, V_r_arr)
-            except (AttributeError, TypeError):
-                # If @njit acts as a passthrough (e.g. Numba disabled or not installed)
-                compute_outer_product_contribution_numba(partial_rdm, ii_arr, V_r_arr)
+        compute_outer_product_contribution(partial_rdm, ii_arr, V_r_arr, is_complex)
 
     return partial_rdm
 
