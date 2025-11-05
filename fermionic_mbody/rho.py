@@ -691,3 +691,182 @@ def rho_m(state: np.ndarray, rho_arrays: sparse.COO) -> sparse.COO:
         return sparse.einsum("bkl,ijkl->bij", state, rho_arrays)
 
     raise ValueError("`state` must be a ket, density matrix, or batch thereof")
+
+# =====================================================================
+# DIRECT M-RDM CALCULATION 
+# =====================================================================
+
+@njit(cache=True)
+def compute_outer_product_contribution_numba(partial_rdm, ii_arr, V_r_arr):
+    """
+    Numba-accelerated calculation of outer product contribution to RDM.
+    Updates partial_rdm in place: RDM += V_r^\dagger @ V_r
+    """
+    n = len(ii_arr)
+    is_complex = partial_rdm.dtype.kind == 'c'
+
+    # Pre-calculate conjugation
+    conj_V_r_arr = np.conj(V_r_arr)
+
+    for i in range(n):
+        ii = ii_arr[i]
+        conj_V_i = conj_V_r_arr[i]
+        
+        # Leverage Hermitian property RDM[ii, jj] = conj(RDM[jj, ii])
+        for j in range(i, n):
+            jj = ii_arr[j]
+            V_j = V_r_arr[j]
+            
+            # Contribution: RDM[ii, jj] += conj(V_i) * V_j
+            contribution = conj_V_i * V_j
+            
+            partial_rdm[ii, jj] += contribution
+            
+            if i != j:
+                # Add the symmetric part RDM[jj, ii]
+                if is_complex:
+                    partial_rdm[jj, ii] += np.conj(contribution)
+                else:
+                    # If real, the contribution is real.
+                    partial_rdm[jj, ii] += contribution
+
+def _process_chunk_direct_rdm(args):
+    """
+    Worker function for direct M-RDM calculation.
+    Computes the contribution to the RDM from a chunk of (N-m) states (R).
+    """
+    r_indices_chunk, connections, D_m, psi = args
+    
+    # Determine dtype for the RDM, ensuring sufficient precision.
+    if psi.dtype.kind == 'c':
+        rdm_dtype = np.complex128 if np.dtype(psi.dtype).itemsize < 16 else psi.dtype
+    else:
+        rdm_dtype = np.float64 if np.dtype(psi.dtype).itemsize < 8 else psi.dtype
+
+    # Initialize partial RDM matrix for this chunk
+    partial_rdm = np.zeros((D_m, D_m), dtype=rdm_dtype)
+
+    # Iterate over intermediate states r in the chunk
+    for r_idx in r_indices_chunk:
+        # Calculate the intermediate vector V_r (only non-zero elements)
+        ii_list = []
+        V_r_elements = []
+        
+        # Iterate over m-body basis I (O(D_m))
+        for ii in range(D_m):
+            key = (r_idx, ii)
+            if key in connections:
+                c_idx, sign = connections[key]
+                
+                # Optimization: only consider contributions if psi[c_idx] is non-zero
+                if psi[c_idx] != 0:
+                    # Ensure type consistency for accumulation
+                    V_r_element = rdm_dtype.type(psi[c_idx] * sign)
+                    ii_list.append(ii)
+                    V_r_elements.append(V_r_element)
+
+        if not V_r_elements:
+            continue
+            
+        # Convert to numpy arrays for Numba
+        ii_arr = np.array(ii_list, dtype=np.int64) # Indices
+        V_r_arr = np.array(V_r_elements, dtype=rdm_dtype)
+        
+        # Calculate outer product contribution and add to partial_rdm
+        if USE_NUMBA:
+            compute_outer_product_contribution_numba(partial_rdm, ii_arr, V_r_arr)
+        else:
+            # Python fallback
+            try:
+                compute_outer_product_contribution_numba.py_func(partial_rdm, ii_arr, V_r_arr)
+            except (AttributeError, TypeError):
+                # If @njit acts as a passthrough (e.g. Numba disabled or not installed)
+                compute_outer_product_contribution_numba(partial_rdm, ii_arr, V_r_arr)
+
+    return partial_rdm
+
+def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int | None = None) -> np.ndarray:
+    """
+    Directly calculates the m-body Reduced Density Matrix (M-RDM) for a given state psi.
+
+    This implementation bypasses the creation of the full 4-tensor operator arrays (rho_m_gen),
+    providing significant speedup and memory savings.
+    It uses optimized connection mapping, multiprocessing, and Numba acceleration.
+    """
+    if basis_N.num is None:
+         raise ValueError("basis_N.num (N) must be set for RDM calculation.")
+    
+    if psi.ndim != 1 or psi.shape[0] != basis_N.size:
+        raise ValueError(f"psi must be a 1D state vector matching the basis size {basis_N.size}.")
+
+    N = basis_N.num
+    D = basis_N.d
+    
+    # Setup m-basis
+    m_basis = FixedBasis(D, num=m, pairs=basis_N.pairs) 
+    D_m = m_basis.size
+
+    # Determine RDM dtype (matching logic in worker)
+    if psi.dtype.kind == 'c':
+        rdm_dtype = np.complex128 if np.dtype(psi.dtype).itemsize < 16 else psi.dtype
+    else:
+        rdm_dtype = np.float64 if np.dtype(psi.dtype).itemsize < 8 else psi.dtype
+
+    # Handle edge cases
+    if m > N or N == 0 or m < 0:
+        return np.zeros((D_m, D_m), dtype=rdm_dtype)
+        
+    if m == 0:
+        # Norm squared (Tr[rho])
+        norm_sq = np.dot(np.conj(psi), psi)
+        return np.array([[norm_sq]], dtype=rdm_dtype)
+
+    # 1. Pre-calculate indices for basis_N (Required by calculate_connections_v3)
+    basis_indices = {}
+    for mask_c in basis_N.num_ele:
+        # Ensure mask_c is standard int and indices are sorted
+        mask_c_int = int(mask_c)
+        basis_indices[mask_c_int] = sorted([i for i in range(D) if (mask_c_int >> i) & 1])
+
+    # 2. Calculate connections (Reuses the optimized logic from rho_m_gen)
+    # Note: calculate_connections_v3 internally uses USE_NUMBA for sign calculations.
+    connections, mask2idx_Nm, sorted_Nm_masks = calculate_connections_v3(
+        basis_N, m_basis, D, basis_indices)
+    
+    D_Nm = len(sorted_Nm_masks)
+    if D_Nm == 0:
+        return np.zeros((D_m, D_m), dtype=rdm_dtype)
+
+    # 3. Parallel computation (Multiprocessing + Numba workers)
+    n_workers = _ensure_workers(n_workers)
+    
+    r_indices = np.arange(D_Nm)
+    # Use significantly more chunks than workers for better load balancing
+    num_chunks = max(n_workers * 16, 1) 
+    
+    if D_Nm > 0:
+        chunks = np.array_split(r_indices, min(num_chunks, D_Nm))
+    else:
+        chunks = []
+    
+    # Prepare iterable. Pass psi to the workers.
+    iterable = [(list(chunk), connections, D_m, psi) 
+                for chunk in chunks if len(chunk) > 0]
+
+    description = f"RDM_{m} Direct (Numba)" if USE_NUMBA else f"RDM_{m} Direct (Python)"
+    results = chunked(
+        _process_chunk_direct_rdm,
+        iterable,
+        n_workers=n_workers,
+        description=description,
+    )
+
+    # 4. Merge results (Sum partial RDMs)
+    RDM_m = np.sum(results, axis=0)
+    
+    # Final check for real input/output (numerical noise mitigation)
+    if np.isrealobj(psi) and np.isrealobj(RDM_m):
+        return RDM_m.real
+    else:
+        return RDM_m
+
