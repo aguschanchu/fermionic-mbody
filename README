@@ -1,21 +1,20 @@
-### Installing
+# fermionic_mbody: High-Performance M-body Reduced Density Matrix Computation
 
-pip install fermionic-mbody[chem]
+`fermionic_mbody` is a Python library designed for the efficient computation of M-body Reduced Density Matrices (M-RDMs) in fermionic systems. It provides tools to build fermionic bases, generate the sparse 4-tensor RDM generators, and compute the RDMs for specific quantum states.
 
-### Example
-import fermionic_mbody as fmb
-import scipy 
-import numpy as np
+## Key Features
 
-basis = fmb.FixedBasis(d=14, num=10, pairs=False)
+*   **FixedBasis Generation:** Robust handling of fermionic bases, including restrictions to specific particle numbers (N) and paired subspaces.
+*   **Optimized RDM Generation:** Efficient generation of the sparse RDM generator tensors ($T$) using multiprocessing and Numba acceleration.
+*   **Direct RDM Computation:** Includes `rho_m_direct`, which calculates the M-RDM for a given state vector $|\Psi\rangle$ without explicitly building the full 4-tensor generator, offering significant performance benefits.
+*   **Specialized Blocks:** Functions to generate specific blocks relevant for pairing Hamiltonians (e.g., `rho_2_kkbar_gen`).
+*   **Density Matrix Contraction:** The `rho_m` helper efficiently contracts the generator tensors with kets, density matrices, or batches thereof.
 
-H, mol, inp = fmb.datasets.h2o.generate(r=4.0)
-H = H[np.ix_(basis.num_ele, basis.num_ele)].real # Basis subspace
-e, v = scipy.sparse.linalg.eigsh(H, k=1, which='SA', tol=1e-8)
-fund = v[:, 0]
+## Installation
 
-m = 1 # RDM number
-rho_m_arrays = fmb.rho_m_gen(basis, m)
-rho_mat = fmb.rho_m(fund, rho_m_arrays)
+The library relies on standard scientific Python packages (`numpy`, `scipy`, `sparse`, `tqdm`) and `openfermion`. Numba is highly recommended for performance acceleration. Python 3.10+ is recommended.
 
-np.sort(np.linalg.eigvals(rho_mat.todense()))
+```bash
+pip install numpy scipy sparse tqdm openfermion numba
+# To install fermionic_mbody (e.g., from source)
+# pip install .
