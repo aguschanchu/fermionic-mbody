@@ -2,9 +2,9 @@
 from importlib import import_module
 from typing import Any
 
-__all__ = ["h2o"]           # list every dataset module here
+__all__ = ["h2o"]          
 
-def __getattr__(name: str) -> Any:      # pragma: no cover
+def __getattr__(name: str) -> Any:     
     if name in __all__:
         return import_module(f"{__name__}.{name}")
     raise AttributeError(

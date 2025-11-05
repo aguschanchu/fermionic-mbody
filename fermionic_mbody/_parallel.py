@@ -1,6 +1,6 @@
 """
-Thin wrapper around :pyclass:`multiprocessing.Pool` that adds a nice
-:tqdm:`tqdm` progress-bar and lets every other module stay *pool-agnostic*.
+Thin wrapper around multiprocessing.Pool that adds a nice
+tqdm progress-bar and lets every other module stay pool-agnostic.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ def chunked(
     description: str | None = None,
 ) -> list[R]:
     """
-    Map ``fn`` over *iterable* in parallel and return the collected list.
+    Map fn over iterable in parallel and return the collected list.
 
     Parameters
     ----------
@@ -41,7 +41,7 @@ def chunked(
     Returns
     -------
     list
-        The list ``[fn(x) for x in iterable]`` with order preserved.
+        The list [fn(x) for x in iterable] with order preserved.
     """
     n_workers = n_workers or cpu_count()
 

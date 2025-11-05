@@ -1,16 +1,15 @@
 """
-Generators for **m-body reduced density-matrix tensors** ρ(m), specialised
-pairing-blocks, and a convenience contraction helper :func:`rho_m`.
+Generators for m-body reduced density-matrix tensors ρ(m), specialised
+pairing-blocks, and a convenience contraction helper rho_m.
 
 All heavy lifting is off-loaded to
-:pyfunc:`fermibasis._parallel.chunked`, which wraps a
-:multiprocessing:`multiprocessing.Pool`.
+fermibasis._parallel.chunked, which wraps a multiprocessing.Pool.
 """
 
 from __future__ import annotations
 
 import itertools
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Optional, Sequence, Callable
 
 import numpy as np
 import openfermion as of
@@ -56,10 +55,10 @@ def _restrict_last2(tensor, subset):
     """
     subset = np.asarray(subset)
 
-    # 1) cut the **last** axis: …, full_dim  ->  …, k
+    # 1) cut the last axis: …, full_dim  ->  …, k
     tensor = tensor[(Ellipsis, subset)]             # ⇢ shape (..., full, k)
 
-    # 2) cut what is now the **penultimate** axis (was full_dim)
+    # 2) cut what is now the penultimate axis (was full_dim)
     #    build an index tuple like  (..., subset, :)
     nd  = tensor.ndim
     idx = [slice(None)] * (nd - 2) + [subset, slice(None)]
@@ -80,14 +79,14 @@ def subspace_aware(gen_fn):
 
         # --- slice it back ---------------------------------------------------------
         mapping = mask_to_index_map(basis.d, basis.num)
-        subset  = np.fromiter((mapping[m] for m in basis.num_ele), int)
+        subset  = np.fromiter((mapping[m] for m in basis.bitmasks), int)
         return _restrict_last2(tensor_full, subset)
     return wrapper
 
 
 
 # =====================================================================
-# OPTIMIZED RHO_M_GEN IMPLEMENTATION (Numba acceleration)
+# OPTIMIZED RHO_M_GEN IMPLEMENTATION 
 # =====================================================================
 
 # ---------------------------------------------------------------------
@@ -213,11 +212,11 @@ def calculate_connections_v3(basis_N: FixedBasis, m_basis: FixedBasis, d: int, b
     N = basis_N.num
     if N is None: return {}, {}, []
     m = m_basis.num
-    mask2idx_m = m_basis._mask2idx
+    mask2idx_m = m_basis._mask2idx_cache
 
     # Pass 1: Identify Nm_masks (Python loop, optimized by subset iteration)
     Nm_masks = set()
-    for mask_c in basis_N.num_ele:
+    for mask_c in basis_N.bitmasks:
         indices_c = basis_N_indices[mask_c]
         # Iterate over all combinations of size m (subsets)
         for indices_i in itertools.combinations(indices_c, m):
@@ -234,7 +233,7 @@ def calculate_connections_v3(basis_N: FixedBasis, m_basis: FixedBasis, d: int, b
     
     # Pass 2: Calculate connections
     connections = {}
-    for c_idx, mask_c in enumerate(basis_N.num_ele):
+    for c_idx, mask_c in enumerate(basis_N.bitmasks):
         indices_c = basis_N_indices[mask_c]
         
         for indices_i_tuple in itertools.combinations(indices_c, m):
@@ -328,7 +327,7 @@ def rho_m_gen(
     basis: FixedBasis, m: int, *, n_workers: int | None = None
 ) -> sparse.COO:
     """
-    Build the sparse ρ(m) tensor (V3.1: Direct Connection Mapping with Numba Acceleration).
+    Build the sparse ρ(m) tensor
     """
     if basis.num is None:
          raise ValueError("basis.num must be set for RDM generation.")
@@ -353,7 +352,7 @@ def rho_m_gen(
 
     # Pre-calculate indices for basis (Optimization for subset iteration)
     basis_indices = {}
-    for mask_c in basis.num_ele:
+    for mask_c in basis.bitmasks:
         # Ensure indices are sorted (required for correct sign calculation)
         basis_indices[mask_c] = sorted([i for i in range(basis.d) if (mask_c >> i) & 1])
 
@@ -386,7 +385,7 @@ def rho_m_gen(
     iterable = [(list(chunk), connections, D_m, coord_dtype) 
                 for chunk in chunks if len(chunk) > 0]
 
-    description = f"ρ_{m} (V3.1 Numba)" if USE_NUMBA else f"ρ_{m} (V3.1 Python)"
+    description = f"ρ_{m}" if USE_NUMBA else f"ρ_{m}"
     results = chunked(
         _process_chunk_connections_v3,
         iterable,
@@ -424,12 +423,12 @@ def _process_m_chunk(
     Parameters
     ----------
     args
-        Tuple ``(ii_chunk, m_basis, full_basis)``.
+        Tuple (ii_chunk, m_basis, full_basis).
 
     Returns
     -------
     (indices, values)
-        *indices* is a list of ``[i, j, r, c]``; *values* the matching numbers.
+        indices is a list of [i, j, r, c]; values the matching numbers.
     """
     ii_chunk, m_basis, basis = args
     indices, values = [], []
@@ -438,7 +437,7 @@ def _process_m_chunk(
         for jj in range(m_basis.size):
             op = m_basis.base[jj] * of.utils.hermitian_conjugated(m_basis.base[ii])
             mat = number_preserving_matrix(op, basis.d, basis.num)
-            mat = restrict_sector_matrix(mat, basis.num_ele, basis.d, basis.num)
+            mat = restrict_sector_matrix(mat, basis.bitmasks, basis.d, basis.num)
             rows, cols = mat.nonzero()
             indices.extend([[ii, jj, r, c] for r, c in zip(rows, cols)])
             values.extend(mat.data)
@@ -452,23 +451,23 @@ def rho_m_gen_legacy(
     basis: FixedBasis, m: int, *, n_workers: int | None = None
 ) -> sparse.COO:
     """
-    Build the sparse ρ(m) tensor with indices ``[i, j, r, c]``.
+    Build the sparse ρ(m) tensor with indices [i, j, r, c].
 
     Parameters
     ----------
     basis
-        Full-system **N-body** basis (often built with ``num=N``).
+        Full-system N-body basis (built with num=N).
     m
         Order of the reduced density matrix (1 ≤ m ≤ N).
     n_workers
-        Number of processes for parallel execution (defaults to *all*).
+        Number of processes for parallel execution (defaults to all).
 
     Returns
     -------
     sparse.COO
-        Shape ``(m_dim, m_dim, N_dim, N_dim)`` where
-        ``m_dim = |FixedBasis(d, num=m)|`` and
-        ``N_dim = basis.size``.
+        Shape (m_dim, m_dim, N_dim, N_dim) where
+        m_dim = |FixedBasis(d, num=m)| and
+        N_dim = basis.size.
     """
     m_basis = FixedBasis(basis.d, num=m)
     shape = (m_basis.size, m_basis.size, basis.size, basis.size)
@@ -500,7 +499,7 @@ def _block_worker(
     args: Tuple[np.ndarray, FixedBasis, np.ndarray]
 ) -> Tuple[List[List[int]], List[float]]:
     """
-    Worker that fills the *pair-scattering* block
+    Worker that fills the pair-scattering block
 
         c†_k  c†_{\bar l}  c_{\bar j}  c_i
 
@@ -535,12 +534,12 @@ def _block_worker(
 @subspace_aware
 def rho_2_block_gen(basis: FixedBasis, *, n_workers: int | None = None) -> sparse.COO:
     """
-    Generate the *pair-scattering* block
+    Generate the pair-scattering block
 
         ρ₂[i j, k l] = ⟨c†_k  c†_{\bar l}  c_{\bar k}  c_l⟩
 
-    with indices shaped ``(m², m², N_dim, N_dim)``, where
-    ``m = d // 2`` equals the number of *time-reversed* orbital pairs.
+    with indices shaped (m², m², N_dim, N_dim), where
+    m = d // 2 equals the number of time-reversed orbital pairs.
 
     This is the block that appears in standard BCS correlation matrices.
     """
@@ -604,7 +603,7 @@ def _kkbar_worker(
     args: Tuple[np.ndarray, FixedBasis, np.ndarray]
 ) -> Tuple[List[List[int]], List[float]]:
     """
-    Worker that fills the diagonal *k \\bar k* block
+    Worker that fills the diagonal k \bar k block
 
         c†_k  c†_{\bar k}  c_{\bar j}  c_j
     """
@@ -635,11 +634,11 @@ def _kkbar_worker(
 @subspace_aware
 def rho_2_kkbar_gen(basis: FixedBasis, *, n_workers: int | None = None) -> sparse.COO:
     """
-    Generate the diagonal *k \\bar k* block
+    Generate the diagonal k \bar k block
 
         ρ₂[k, j] = ⟨c†_k  c†_{\bar k}  c_{\bar j}  c_j⟩
 
-    with shape ``(m, m, N_dim, N_dim)`` where ``m = d // 2``.
+    with shape (m, m, N_dim, N_dim where m = d // 2.
     """
     m_pairs = basis.d // 2
     it_set = np.arange(m_pairs)
@@ -669,16 +668,16 @@ def rho_2_kkbar_gen(basis: FixedBasis, *, n_workers: int | None = None) -> spars
 # ---------------------------------------------------------------------
 def rho_m(state: np.ndarray, rho_arrays: sparse.COO) -> sparse.COO:
     """
-    Contract a *state* (ket, density matrix, or batch) with a pre-built ρ(m).
+    Contract a state (ket, density matrix, or batch) with a pre-built ρ(m).
 
     Parameters
     ----------
     state
-        • |Ψ⟩ ∈ ℂ^dim                → returns ``⟨Ψ|ρ(m)|Ψ⟩`` (*dense* 2-D block).  
-        • ρ   ∈ ℂ^{dim×dim}          → returns ``Tr₂[ρ ⋅ ρ(m)]``.  
+        • |Ψ⟩ ∈ ℂ^dim                → returns ⟨Ψ|ρ(m)|Ψ⟩ (dense 2-D block).  
+        • ρ   ∈ ℂ^{dim×dim}          → returns Tr₂[ρ ⋅ ρ(m)].  
         • batch |Ψ_b⟩ ∈ ℂ^{B×dim}    → returns a *batch* of 2-D blocks.
     rho_arrays
-        Tensor built by :func:`rho_m_gen` or the specialised helpers above.
+        Tensor built by rho_m_gen or the specialised helpers above.
     """
     ndim = state.ndim
     if ndim == 1:  # single ket
@@ -690,7 +689,7 @@ def rho_m(state: np.ndarray, rho_arrays: sparse.COO) -> sparse.COO:
     if ndim == 3:  # batch of kets
         return sparse.einsum("bkl,ijkl->bij", state, rho_arrays)
 
-    raise ValueError("`state` must be a ket, density matrix, or batch thereof")
+    raise ValueError("state must be a ket, density matrix, or batch thereof")
 
 # =====================================================================
 # DIRECT M-RDM CALCULATION 
@@ -710,15 +709,15 @@ def compute_outer_product_contribution_numba(partial_rdm, ii_arr, V_r_arr):
 
     for i in range(n):
         ii = ii_arr[i]
-        conj_V_i = conj_V_r_arr[i]
+        V_i = V_r_arr[i]
         
         # Leverage Hermitian property RDM[ii, jj] = conj(RDM[jj, ii])
         for j in range(i, n):
             jj = ii_arr[j]
-            V_j = V_r_arr[j]
+            conj_V_j = conj_V_r_arr[j]
             
             # Contribution: RDM[ii, jj] += conj(V_i) * V_j
-            contribution = conj_V_i * V_j
+            contribution = conj_V_j * V_i
             
             partial_rdm[ii, jj] += contribution
             
@@ -823,7 +822,7 @@ def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int
 
     # 1. Pre-calculate indices for basis_N (Required by calculate_connections_v3)
     basis_indices = {}
-    for mask_c in basis_N.num_ele:
+    for mask_c in basis_N.bitmasks:
         # Ensure mask_c is standard int and indices are sorted
         mask_c_int = int(mask_c)
         basis_indices[mask_c_int] = sorted([i for i in range(D) if (mask_c_int >> i) & 1])

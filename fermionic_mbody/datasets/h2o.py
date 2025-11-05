@@ -5,13 +5,13 @@ from typing import Tuple
 import numpy as np
 import openfermion as of
 from openfermion.chem import MolecularData
-import openfermionpyscf                       # registers PySCF plugin
+import openfermionpyscf                       
 from scipy.sparse import csr_matrix
 
 
 def generate(r: float = 3.5) -> Tuple[csr_matrix, "pyscf.gto.Mole", MolecularData]:
     """
-    Return (sparse Hamiltonian, pyscf.mol, MolecularData) for H₂O at bond length *r* (Bohr).
+    Return (sparse Hamiltonian, pyscf.mol, MolecularData) for H₂O at bond length r (Bohr).
     STO-3G basis, restricted Hartree–Fock.
     """
     theta = np.deg2rad(104.5)
@@ -30,8 +30,8 @@ def generate(r: float = 3.5) -> Tuple[csr_matrix, "pyscf.gto.Mole", MolecularDat
     sparse_h = of.get_sparse_operator(jw_ham).tocsr()
     
     try:
-        pyscf_mol = mol_data.molecule                 # old OpenFermion
+        pyscf_mol = mol_data.molecule                 
     except AttributeError:
-        pyscf_mol = mol_data._pyscf_data["mol"]       # OpenFermion-PySCF 0.5+
+        pyscf_mol = mol_data._pyscf_data["mol"]       
 
     return sparse_h, pyscf_mol, mol_data

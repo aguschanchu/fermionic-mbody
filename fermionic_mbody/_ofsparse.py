@@ -9,8 +9,9 @@ from functools import lru_cache
 from itertools import combinations
 
 # ---------------------------------------------------------------------
-#  private routines copied from OF
+#  private routines copied from OpenFermion
 # ---------------------------------------------------------------------
+
 def _iterate_basis_order_(reference_determinant: Sequence[bool],
                           order: int) -> Iterator[np.ndarray]:
     occupied_indices = np.where(reference_determinant)[0]
@@ -97,6 +98,7 @@ def restrict_sector_matrix(mat: sparse.spmatrix,
 # ---------------------------------------------------------------------
 #  the high-level helper used by rho.py
 # ---------------------------------------------------------------------
+
 def number_preserving_matrix(op: of.FermionOperator,
                              d: int,
                              n: int,

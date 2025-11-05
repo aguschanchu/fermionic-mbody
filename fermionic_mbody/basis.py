@@ -1,16 +1,19 @@
 """
-Fixed single–particle operator bases and fast ⟨ψ|Ô|φ⟩ helpers.
+Fixed single-particle operator bases and ⟨ψ|Ô|φ⟩ helpers.
 
-This module contains the :class:`FixedBasis` class, which is the backbone
-for every ρ(m) tensor we later build: it keeps a *canonical* vector basis
-|eₖ⟩, an aligned list of :class:`openfermion.FermionOperator` objects, and
+This module contains the FixedBasis class, which is the backbone
+for every ρ(m) tensor we later build: it keeps a canonical vector basis
+|eₖ⟩, an aligned list of openfermion.FermionOperator objects, and
 utility methods to map between them quickly.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Dict
+from scipy import sparse as sp_sparse
+import itertools
+from ._ofsparse import number_preserving_matrix, restrict_sector_matrix
 
 import numpy as np
 import openfermion as of
@@ -26,30 +29,25 @@ class FixedBasis:
     """
     Single-particle ladder-operator basis for fermionic many-body work.
 
-    The class builds *one* fixed set of second-quantised operators
+    The class builds one fixed set of second-quantised operators
     (c†_i or products thereof) together with a canonical vector basis
     |e_k⟩ so that you can
 
-    * map between integer indices and FermionOperator objects,
-    * compute ⟨ψ|Ô|φ⟩ matrix elements quickly,
-    * generate reduced density-matrix blocks.
+    - map between integer indices and FermionOperator objects,
+    - compute ⟨ψ|Ô|φ⟩ matrix elements quickly,
+    - generate reduced density-matrix blocks.
 
     Parameters
     ----------
     d
         Number of single-particle modes.
     num
-        Restrict the basis to *m-body* operators (`num = m`).
-        If *None*, return the full 0…d operator basis.
+        Restrict the basis to m-body operators (num = m).
+        If None, return the full 0…d operator basis.
     pairs
-        When *True*, only keep operators that act on *paired* levels
+        When True, only keep operators that act on paired levels
         (e.g. time-reversed orbitals k / \\bar k).
-
-    Notes
-    -----
-    *If* you plan to use the specialised ``ρ₂`` helpers below
-    (those assuming two-level “k / \\bar k” pairs) you most likely
-    want ``d`` to be *even* and ``pairs=True``.
+        
     """
 
     d: int
@@ -58,10 +56,10 @@ class FixedBasis:
 
     # --- internals filled in __post_init__ --------------------------------
     base: List[of.FermionOperator] = field(init=False, repr=False)
-    num_ele: np.ndarray = field(init=False, repr=False)
+    bitmasks: np.ndarray = field(init=False, repr=False)
     size: int = field(init=False)
     canonicals: np.ndarray = field(init=False, repr=False)
-    signs: np.ndarray = field(init=False, repr=False)
+    _mask2idx_cache: Dict[int, int] = field(init=False, repr=False)
 
     # ---------------------------------------------------------------------
     # public helpers
@@ -70,44 +68,65 @@ class FixedBasis:
         """Return the canonical |e_idx⟩ vector in ℂ^size."""
         return self.canonicals[idx]
 
+    @property
+    def num_ele(self) -> np.ndarray:
+        return self.bitmasks
+
     # .....................................................................
     def opr_to_idx(self, opr: of.FermionOperator) -> Optional[int]:
         """
-        Return *idx* such that ``base[idx]`` equals `opr` once normal-ordered.
-
-        Returns
-        -------
-        Optional[int]
-            `None` if the operator is outside the current basis.
+        Return idx such that base[idx] equals opr once normal-ordered.
+        Requires opr to be a single creation string present in the basis.
         """
         norm_op = of.transforms.normal_ordered(opr)
-        if not norm_op.terms:  # empty operator
+        
+        # Check if empty or multiple terms
+        if len(norm_op.terms) != 1:
+            return None
+            
+        term = next(iter(norm_op.terms.keys()))
+
+        # Ensure creation only
+        if any(cd != 1 for _, cd in term):
             return None
 
-        occ_indices = tuple(i for i, _ in next(iter(norm_op.terms.keys())))
-        bitmask = sum(1 << i for i in occ_indices)
+        bitmask = sum(1 << i for i, _ in term)
 
-        matches = np.where(self.num_ele == bitmask)[0]
-        return int(matches[0]) if matches.size else None
+        # Use the cached internal mapping
+        return self._mask2idx_cache.get(bitmask)
 
-    # .....................................................................
-    def idx_mean_val(self, idx: int, op: of.FermionOperator) -> float:
+    def get_operator_matrix(self, op: of.FermionOperator) -> sp_sparse.spmatrix:
+        """
+        Return the sparse matrix representation of op in this fixed basis.
+        O[i, j] = <e_i| op |e_j>.
+        """
+        if self.num is not None:
+            # Efficient path for N-particle sector
+            mat_N = number_preserving_matrix(op, self.d, self.num)
+            # Restrict to the subset defined by the basis
+            mat_restricted = restrict_sector_matrix(mat_N, self.bitmasks, self.d, self.num)
+            return mat_restricted
+        
+        # Fallback for full Fock space
+        mat_fock = of.get_sparse_operator(op, self.d)
+        if self.size == (1 << self.d):
+            return mat_fock
+        
+        # Extract submatrix using bitmasks as indices in Fock space
+        indices = self.bitmasks
+        return mat_fock[np.ix_(indices, indices)]
+
+    # Update return types to complex and use get_operator_matrix
+    def idx_mean_val(self, idx: int, op: of.FermionOperator) -> complex:
         """Compute ⟨e_idx| op |e_idx⟩ in the canonical basis."""
-        ket = self.idx_to_repr(idx)
-        return float(np.real(ket.T @ of.get_sparse_operator(op, self.d) @ ket))
+        mat = self.get_operator_matrix(op)
+        return complex(mat[idx, idx])
 
-    # .....................................................................
     def idx_contraction(
-        self, bra_idx: int, ket_idx: int, op: of.FermionOperator
-    ) -> float:
+        self, bra_idx: int, ket_idx: int, op: of.FermionOperator) -> complex:
         """Compute ⟨e_bra| op |e_ket⟩ given canonical indices."""
-        bra, ket = map(self.idx_to_repr, (bra_idx, ket_idx))
-        return float(np.real(bra.T @ of.get_sparse_operator(op, self.d) @ ket))
-
-    # .....................................................................
-    @property
-    def _mask2idx(self) -> dict[int, int]:
-        return {int(mask): idx for idx, mask in enumerate(self.num_ele)}
+        mat = self.get_operator_matrix(op)
+        return complex(mat[bra_idx, ket_idx])
 
     # .....................................................................
     def opr_to_vect(self,
@@ -123,8 +142,8 @@ class FixedBasis:
             ----------
             opr : FermionOperator
                 The operator to be expanded.  It must be a sum of pure
-                *creation* strings whose particle number equals
-                ``self.num`` (i.e. the m-body basis you built).
+                creation strings whose particle number equals
+                self.num.
             dtype : numpy dtype, optional
                 Type of the returned vector (default complex128).
             tol : float, optional
@@ -138,7 +157,7 @@ class FixedBasis:
             vec : ndarray, shape (|basis|,)
                 Coefficient vector such that
                     Σ_k vec[k] · basis.base[k]  ==  opr
-                after normal ordering (up to round-off).
+                after normal ordering.
             """
             vec = np.zeros(self.size, dtype=dtype)
 
@@ -147,9 +166,9 @@ class FixedBasis:
             for term, coeff in norm_op.terms.items():
 
                 if abs(coeff) <= tol:
-                    continue                                    # too small
+                    continue                                    
 
-                # ensure “creation only’’  (cd = 1)  otherwise not in this basis
+                # ensure creation only  (cd = 1)  otherwise not in this basis
                 if any(cd != 1 for _, cd in term):
                     raise ValueError(
                         f"term {term} contains annihilation operator; "
@@ -160,7 +179,7 @@ class FixedBasis:
                 for i, _ in term:
                     mask |= 1 << i
 
-                idx = self._mask2idx.get(mask)
+                idx = self._mask2idx_cache.get(mask)
                 if idx is None:
                     if allow_missing:
                         continue
@@ -175,15 +194,14 @@ class FixedBasis:
         for idx, coeff in enumerate(vec):
             if coeff != 0:
                 op += coeff * self.base[idx]
-        return of.transforms.normal_ordered(op)
-
+        return op
 
     # ---------------------------------------------------------------------
     # static shortcuts
     # ---------------------------------------------------------------------
     @staticmethod
     def int_to_bin(k: int, d: int) -> str:
-        """Little-endian, zero-padded binary string of length `d`."""
+        """Little-endian, zero-padded binary string of length d."""
         return np.base_repr(k, base=2).zfill(d)[::-1]
 
     # .....................................................................
@@ -195,7 +213,7 @@ class FixedBasis:
 
     @property
     def m(self) -> Optional[int]:
-        """Alias for *num* (kept for backward-compatibility)."""
+        """Alias for num (kept for backward-compatibility)."""
         return self.num
     
     @staticmethod
@@ -204,51 +222,71 @@ class FixedBasis:
         Convert an integer det into the
         corresponding creation-operator string |vac⟩ → |det⟩
         """
-        op = of.FermionOperator(())            # start with vacuum |0>
+        terms = []
         for q in range(n_qubits):
-            if (det >> q) & 1:              # bit q is occupied?
-                op *= of.FermionOperator(((q, 1),))   # a†_q
-        return op
+            if (det >> q) & 1:
+                terms.append((q, 1))
+        
+        return of.FermionOperator(tuple(terms))
     
     # ---------------------------------------------------------------------
     # internal machinery
     # ---------------------------------------------------------------------
-    def __post_init__(self) -> None:  # noqa: D401  (simple verb ok)
+    def __post_init__(self) -> None:  
         """Populate internal tables after dataclass creation."""
-        self.base, self.num_ele = self._create_basis()
+        self.base, self.bitmasks = self._create_basis()
         self.size = len(self.base)
         self.canonicals = np.eye(self.size)
-        self.signs = self._signs_gen()
+        self._mask2idx_cache = {int(mask): idx for idx, mask in enumerate(self.bitmasks)}
 
     # ................................................................. internal helpers
     def _create_basis(self) -> Tuple[List[of.FermionOperator], np.ndarray]:
         """Generate basis list + bit-mask array."""
         basis, masks = [], []
-        for k in range(1 << self.d):  # noqa: PLR1703 (d is small anyway)
-            bits = self.int_to_bin(k, self.d)
+
+        # Case 1: Fixed particle number AND no pairing restriction 
+        if self.num is not None and not self.pairs:
+            if self.num < 0 or self.num > self.d:
+                return basis, np.array(masks, dtype=int)
+
+            for indices in itertools.combinations(range(self.d), self.num):
+                k = sum(1 << i for i in indices)
+                masks.append(k)
+                terms = tuple((i, 1) for i in indices)
+                basis.append(of.FermionOperator(terms))
+            
+            # Ensure ascending order (combinations guarantees this)
+            return basis, np.array(masks, dtype=int)
+
+        # Case 2: Full Fock space OR pairing restriction (Iterate over 2^d)
+        for k in range(1 << self.d):  
+            if hasattr(int, 'bit_count'):
+                    count = k.bit_count()
+            else:
+                    count = bin(k).count("1")
 
             # particle-number restriction?
-            if self.num is not None and bits.count("1") != self.num:
+            if self.num is not None and count != self.num:
                 continue
 
             # k / \bar k pairing restriction?
-            if self.pairs and not np.all(bits[::2] == bits[1::2]):
-                continue
+            # Assumes interleaved ordering (0, \bar 0, 1, \bar 1, ...)
+            if self.pairs:
+                is_paired = True
+                for i in range(self.d // 2):
+                    bit_pair = (k >> (2*i)) & 3
+                    # Valid paired configurations are 00 (0) or 11 (3).
+                    if bit_pair == 1 or bit_pair == 2: # (01 or 10)
+                        is_paired = False
+                        break
+                
+                if not is_paired:
+                    continue
 
-            basis.append(self.bin_to_op(bits))
+            basis.append(self._det2op(k, self.d))
             masks.append(k)
 
-        return basis, np.fromiter(masks, dtype=int)
-
-    # .....................................................................
-    def _signs_gen(self) -> np.ndarray:
-        """Return sign( leading coefficient ) for each operator in `base`."""
-        signs = []
-        for op in self.base:
-            op_n = of.transforms.normal_ordered(op)
-            coeff = next(iter(op_n.terms.values())) if op_n.terms else 0
-            signs.append(np.sign(coeff))
-        return np.asarray(signs)
+        return basis, np.array(masks, dtype=int)
 
     # -----------------------------------------------------------------
     # alternate constructor: build a Basis from a subset of another one
@@ -257,10 +295,10 @@ class FixedBasis:
     def from_subset(
         cls,
         parent: "FixedBasis",
-        indices: "np.ndarray | list[int]",
+        indices: Sequence[int], 
     ) -> "FixedBasis":
         """
-        Build a *new* FixedBasis that keeps only `indices` from `parent`.
+        Build a new FixedBasis that keeps only indices from parent.
 
         Parameters
         ----------
@@ -271,50 +309,57 @@ class FixedBasis:
 
         Notes
         -----
-        * All cache arrays (``size``, ``canonicals``, ``signs``) are rebuilt
+        - All cache arrays (size, canonicals, signs) are rebuilt
           consistently.
-        * The new instance inherits ``d``, ``num`` and ``pairs`` from
-          `parent`; you can change them afterwards if you really need to.
+        - The new instance inherits d, num and pairs from
+          parent; you can change them afterwards if you really need to.
         """
-        new = cls(d=parent.d, num=parent.num, pairs=parent.pairs)  # empty
+        new = cls.__new__(cls)
+        
+        new.d, new.num, new.pairs = parent.d, parent.num, parent.pairs
+        
+        indices_arr = np.asarray(indices)
+        
         new.base     = [parent.base[i] for i in indices]
-        new.num_ele  = np.asarray(parent.num_ele)[indices]
+        new.bitmasks = parent.bitmasks[indices_arr]
         new.size     = len(new.base)
+        
+        # Rebuild caches
         new.canonicals = np.eye(new.size)
-        new.signs    = new._signs_gen()
+        new._mask2idx_cache = {int(mask): idx for idx, mask in enumerate(new.bitmasks)}
+        
         return new
 
     # ---------------------------------------------------------------------
-    # convenience erialization hooks
+    # convenience serialization hooks
     # ---------------------------------------------------------------------
     def __getstate__(self) -> dict:
         """
-        Return a *small* dict that is safe to send to Ray workers.
+        Return a small dict that is safe to send to Ray workers.
         """
-        return {"d": self.d, "num": self.num, "pairs": self.pairs, 'num_ele': self.num_ele}
+        # Save using the new name 'bitmasks'
+        return {"d": self.d, "num": self.num, "pairs": self.pairs, 'bitmasks': self.bitmasks}
 
     def __setstate__(self, state: dict) -> None:
         """Rebuild heavy caches locally after unpickling."""
         self.d     = state["d"]
         self.num   = state["num"]
         self.pairs = state["pairs"]
-        self.num_ele = np.asarray(state["num_ele"], dtype=np.int64)
 
-        # rebuild every cache the same way __post_init__ does
-        self.base   = [self._det2op(det, self.d) for det in self.num_ele]
+        # Handle backward compatibility: Load from 'bitmasks' or 'num_ele'
+        if 'bitmasks' in state:
+             self.bitmasks = np.asarray(state["bitmasks"], dtype=np.int64)
+        elif 'num_ele' in state:
+             # Load from old serialization format
+             self.bitmasks = np.asarray(state["num_ele"], dtype=np.int64)
+        else:
+            raise ValueError("Missing 'bitmasks' or 'num_ele' in serialized state.")
+
+        # rebuild every cache
+        self.base   = [self._det2op(det, self.d) for det in self.bitmasks]
         self.size      = len(self.base)
         self.canonicals = np.eye(self.size)
-        self.signs     = self._signs_gen()
-
-    @classmethod
-    def from_state(cls, state: dict) -> "FixedBasis":
-        """
-        Recreate a FixedBasis from the output of __getstate__ without
-        calling the regular __init__ (avoids double work when unpickling).
-        """
-        obj = cls.__new__(cls)  # bypass __init__
-        obj.__setstate__(state)
-        return obj
+        self._mask2idx_cache = {int(mask): idx for idx, mask in enumerate(self.bitmasks)}
 
     # ---------------------------------------------------------------------
     # convenience FermionOperator factories

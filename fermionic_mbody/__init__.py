@@ -1,7 +1,5 @@
 """
-Top-level namespace for the *fermionic_mbody* package.
-
-We re-export the public API that users expect to import directly.
+Top-level namespace for the fermionic_mbody package.
 """
 from importlib import import_module
 from types import ModuleType
@@ -13,6 +11,7 @@ from .rho import (
     rho_2_block_gen,
     rho_2_kkbar_gen,
     rho_m,
+    rho_m_direct
 )
 
 __all__ = [
