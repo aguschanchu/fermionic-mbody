@@ -437,7 +437,7 @@ def _process_m_chunk(
         for jj in range(m_basis.size):
             op = m_basis.base[jj] * of.utils.hermitian_conjugated(m_basis.base[ii])
             mat = number_preserving_matrix(op, basis.d, basis.num)
-            mat = restrict_sector_matrix(mat, basis.bitmasks, basis.d, basis.num)
+            mat = restrict_sector_matrix(mat, basis.bitmasks, basis.d, basis.num).tocoo()
             rows, cols = mat.nonzero()
             indices.extend([[ii, jj, r, c] for r, c in zip(rows, cols)])
             values.extend(mat.data)
@@ -521,7 +521,7 @@ def _block_worker(
             op1 = of.FermionOperator(((2 * k, 1), (2 * l + 1, 1)))
 
             op = op1 * op2
-            mat = number_preserving_matrix(op, basis.d, basis.num)
+            mat = number_preserving_matrix(op, basis.d, basis.num).tocoo()
 
             rows, cols = mat.nonzero()
             for r, c, v in zip(rows, cols, mat.data):
@@ -620,7 +620,7 @@ def _kkbar_worker(
             op1 = of.FermionOperator(((2 * jj, 1), (2 * jj + 1, 1)))
 
             op = op1 * op2
-            mat = number_preserving_matrix(op, basis.d, basis.num)
+            mat = number_preserving_matrix(op, basis.d, basis.num).tocoo()
 
             rows, cols = mat.nonzero()
             for r, c, v in zip(rows, cols, mat.data):
@@ -666,30 +666,58 @@ def rho_2_kkbar_gen(basis: FixedBasis, *, n_workers: int | None = None) -> spars
 # ---------------------------------------------------------------------
 # contraction helper
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# contraction helper
+# ---------------------------------------------------------------------
 def rho_m(state: np.ndarray, rho_arrays: sparse.COO) -> sparse.COO:
     """
     Contract a state (ket, density matrix, or batch) with a pre-built ρ(m).
 
+    Calculates the RDM according to the library convention: 
+    RDM[i,j] = <Ψ| O_ij |Ψ> where O_ij = C_j† C_i.
+    Uses the generator T[i, j, k, l] = <k| O_ij |l>.
+
     Parameters
     ----------
-    state
-        • |Ψ⟩ ∈ ℂ^dim                → returns ⟨Ψ|ρ(m)|Ψ⟩ (dense 2-D block).  
-        • ρ   ∈ ℂ^{dim×dim}          → returns Tr₂[ρ ⋅ ρ(m)].  
-        • batch |Ψ_b⟩ ∈ ℂ^{B×dim}    → returns a *batch* of 2-D blocks.
-    rho_arrays
-        Tensor built by rho_m_gen or the specialised helpers above.
+    state : ndarray
+        The state to contract.
+        • Ket |Ψ⟩ (1D): RDM[i,j] = Σ_kl Ψ*_k T_ijkl Ψ_l.
+        • Density matrix ρ (2D): RDM[i,j] = Tr[T ρ] = Σ_kl T_ijkl ρ_lk.
+        • Batch of kets (2D, B x N_dim).
+        • Batch of density matrices (3D, B x N_dim x N_dim).
+        
+    rho_arrays : sparse.COO
+        Tensor built by rho_m_gen.
     """
     ndim = state.ndim
-    if ndim == 1:  # single ket
-        return sparse.einsum("k,ijkl,l->ij", state, rho_arrays, state)
+    N_dim = rho_arrays.shape[2]
 
-    if ndim == 2:  # density matrix
-        return sparse.einsum("ijkl,kl->ij", rho_arrays, state)
+    # Case 1: Single ket (1D)
+    if ndim == 1:
+        if state.shape[0] != N_dim:
+             raise ValueError(f"State dimension mismatch. Expected ({N_dim},), got {state.shape}.")
+        return sparse.einsum("k,ijkl,l->ij", np.conj(state), rho_arrays, state)
 
-    if ndim == 3:  # batch of kets
-        return sparse.einsum("bkl,ijkl->bij", state, rho_arrays)
+    # Case 2: Density Matrix (2D, square) or Batch of Kets (2D, B x dim)
+    if ndim == 2:
+        if state.shape == (N_dim, N_dim): # Density matrix ρ
+            return sparse.einsum("ijkl,lk->ij", rho_arrays, state)
+        
+        elif state.shape[1] == N_dim: # Batch of kets (B, dim)
+            return sparse.einsum("bk,ijkl,bl->bij", np.conj(state), rho_arrays, state)
+        
+        else:
+            raise ValueError(f"Invalid shape for 2D state: {state.shape}. Expected ({N_dim}, {N_dim}) or (B, {N_dim}).")
 
-    raise ValueError("state must be a ket, density matrix, or batch thereof")
+    # Case 3: Batch of Density Matrices (3D, B x dim x dim)
+    if ndim == 3:
+        if state.shape[1:] == (N_dim, N_dim):
+            # RDM[b, i, j] = Σ_{k,l} T[i, j, k, l] ρ_b[l, k]
+            return sparse.einsum("ijkl,blk->bij", rho_arrays, state)
+        else:
+             raise ValueError(f"Invalid shape for 3D state: {state.shape}. Expected (B, {N_dim}, {N_dim}).")
+
+    raise ValueError("state must be a ket, density matrix, or batch thereof (ndim 1-3 supported).")
 
 # =====================================================================
 # DIRECT M-RDM CALCULATION 

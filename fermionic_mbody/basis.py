@@ -241,22 +241,29 @@ class FixedBasis:
 
     # ................................................................. internal helpers
     def _create_basis(self) -> Tuple[List[of.FermionOperator], np.ndarray]:
-        """Generate basis list + bit-mask array."""
+        """Generate basis list + bit-mask array in ascending bitmask order."""
         basis, masks = [], []
 
         # Case 1: Fixed particle number AND no pairing restriction 
         if self.num is not None and not self.pairs:
             if self.num < 0 or self.num > self.d:
-                return basis, np.array(masks, dtype=int)
+                return basis, np.array(masks, dtype=np.int64)
 
+            # 1. Generate all combinations
+            temp_data = []
             for indices in itertools.combinations(range(self.d), self.num):
                 k = sum(1 << i for i in indices)
-                masks.append(k)
                 terms = tuple((i, 1) for i in indices)
-                basis.append(of.FermionOperator(terms))
+                temp_data.append((k, of.FermionOperator(terms)))
             
-            # Ensure ascending order (combinations guarantees this)
-            return basis, np.array(masks, dtype=int)
+            # 2. Sort by bitmask (k)
+            temp_data.sort(key=lambda x: x[0])
+            
+            # 3. Unpack sorted data
+            masks = [k for k, op in temp_data]
+            basis = [op for k, op in temp_data]
+            
+            return basis, np.array(masks, dtype=np.int64)
 
         # Case 2: Full Fock space OR pairing restriction (Iterate over 2^d)
         for k in range(1 << self.d):  
