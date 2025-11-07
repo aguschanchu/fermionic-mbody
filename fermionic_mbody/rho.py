@@ -668,9 +668,6 @@ def rho_2_kkbar_gen(basis: FixedBasis, *, n_workers: int | None = None) -> spars
 # ---------------------------------------------------------------------
 # contraction helper
 # ---------------------------------------------------------------------
-# ---------------------------------------------------------------------
-# contraction helper
-# ---------------------------------------------------------------------
 def rho_m(state: np.ndarray, rho_arrays: sparse.COO) -> sparse.COO:
     """
     Contract a state (ket, density matrix, or batch) with a pre-built ρ(m).
@@ -725,94 +722,179 @@ def rho_m(state: np.ndarray, rho_arrays: sparse.COO) -> sparse.COO:
 # DIRECT M-RDM CALCULATION 
 # =====================================================================
 
-@njit(cache=True)
-def compute_outer_product_contribution(partial_rdm, ii_arr, V_r_arr, is_complex: bool):
+def calculate_connections_csr(basis_N: FixedBasis, m_basis: FixedBasis, d: int, basis_N_indices: Dict[int, List[int]]):
     """
-    Numba-accelerated calculation of outer product contribution to RDM.
-    Updates partial_rdm in place: RDM += V_r^\dagger @ V_r
+    Calculates the connection map and returns a CSR-like representation (dict of numpy arrays)
     """
-    n = len(ii_arr)
+    N = basis_N.num
+    if N is None: return None, {}, []
+    m = m_basis.num
+    mask2idx_m = m_basis._mask2idx_cache
+    D_N = basis_N.size
+    D_m = m_basis.size
 
-    # Pre-calculate conjugation
-    conj_V_r_arr = np.conj(V_r_arr)
-
-    for i in range(n):
-        ii = ii_arr[i]
-        V_i = V_r_arr[i]
-        
-        # Leverage Hermitian property RDM[ii, jj] = conj(RDM[jj, ii])
-        for j in range(i, n):
-            jj = ii_arr[j]
-            conj_V_j = conj_V_r_arr[j]
-            
-            # Contribution: RDM[ii, jj] += conj(V_i) * V_j
-            contribution = conj_V_j * V_i
-            
-            partial_rdm[ii, jj] += contribution
-            
-            if i != j:
-                # Add the symmetric part RDM[jj, ii]
-                if is_complex:
-                    partial_rdm[jj, ii] += np.conj(contribution)
-                else:
-                    # If real, the contribution is real.
-                    partial_rdm[jj, ii] += contribution
-
-def _process_chunk_direct_rdm(args):
-    """
-    Worker function for direct M-RDM calculation.
-    Computes the contribution to the RDM from a chunk of (N-m) states (R).
-    """
-    r_indices_chunk, connections, D_m, psi = args
-    
-    # Determine dtype for the RDM, ensuring sufficient precision.
-    if psi.dtype.kind == 'c':
-        rdm_dtype = np.complex128 if np.dtype(psi.dtype).itemsize < 16 else psi.dtype
-        is_complex = True
+    max_dim = max(D_N, D_m)
+    # Use int32 if sufficient, otherwise int64.
+    if max_dim <= np.iinfo(np.int32).max:
+        idx_dtype = np.int32
     else:
-        rdm_dtype = np.float64 if np.dtype(psi.dtype).itemsize < 8 else psi.dtype
-        is_complex = False
+        idx_dtype = np.int64
 
-    # Initialize partial RDM matrix for this chunk
-    partial_rdm = np.zeros((D_m, D_m), dtype=rdm_dtype)
-
-    # Iterate over intermediate states r in the chunk
-    for r_idx in r_indices_chunk:
-        # Calculate the intermediate vector V_r (only non-zero elements)
-        ii_list = []
-        V_r_elements = []
-        
-        # Iterate over m-body basis I (O(D_m))
-        for ii in range(D_m):
-            key = (r_idx, ii)
-            if key in connections:
-                c_idx, sign = connections[key]
-                
-                # Optimization: only consider contributions if psi[c_idx] is non-zero
-                if psi[c_idx] != 0:
-                    # Ensure type consistency for accumulation
-                    V_r_element = rdm_dtype.type(psi[c_idx] * sign)
-                    ii_list.append(ii)
-                    V_r_elements.append(V_r_element)
-
-        if not V_r_elements:
-            continue
+    # Identify Nm_masks (N-m subspace)
+    Nm_masks = set()
+    for mask_c in basis_N.bitmasks:
+        mask_c_int = int(mask_c)
+        indices_c = basis_N_indices[mask_c_int]
+        # Iterate over m-sized subsets
+        for indices_i in itertools.combinations(indices_c, m):
+            mask_i = sum(1 << i for i in indices_i)
             
-        # Convert to numpy arrays for Numba
-        ii_arr = np.array(ii_list, dtype=np.int64) # Indices
-        V_r_arr = np.array(V_r_elements, dtype=rdm_dtype)
+            if mask_i in mask2idx_m:
+                # mask_r = mask_c XOR mask_i
+                Nm_masks.add(mask_c_int ^ mask_i)
+
+    # Create mapping for (N-m) subspace
+    sorted_Nm_masks = sorted(list(Nm_masks))
+    mask2idx_Nm = {mask: idx for idx, mask in enumerate(sorted_Nm_masks)}
+    D_Nm = len(sorted_Nm_masks)
+
+    # alculate connections and organize by r_idx (Temporary structure: list of lists)
+    connections_per_r = [[] for _ in range(D_Nm)]
+
+    # Iterate over N-basis (c_idx)
+    for c_idx, mask_c in enumerate(basis_N.bitmasks):
+        mask_c_int = int(mask_c)
+        indices_c = basis_N_indices[mask_c_int]
         
-        compute_outer_product_contribution(partial_rdm, ii_arr, V_r_arr, is_complex)
+        # Iterate over m-subsets (ii)
+        for indices_i_tuple in itertools.combinations(indices_c, m):
+            mask_i = sum(1 << i for i in indices_i_tuple)
+            
+            if mask_i in mask2idx_m:
+                ii = mask2idx_m[mask_i]
+                mask_r = mask_c_int ^ mask_i
+                r_idx = mask2idx_Nm[mask_r]
+                indices_i_np = np.array(indices_i_tuple, dtype=np.int64)
+                sign = calculate_fermionic_sign_numba(mask_c_int, indices_i_np)
+
+                
+                connections_per_r[r_idx].append((ii, c_idx, sign))
+
+    # Construct the CSR structure
+    indices_ii = []
+    data_c_idx = []
+    data_sign = []
+    # Use int64 for pointers (indptr) to ensure sufficient range
+    indptr = np.zeros(D_Nm + 1, dtype=np.int64)
+    
+    current_ptr = 0
+    for r_idx in range(D_Nm):
+        conns = connections_per_r[r_idx]
+        # Sorting by ii improves memory access patterns in the kernel
+        conns.sort(key=lambda x: x[0])
+        
+        for ii, c_idx, sign in conns:
+            indices_ii.append(ii)
+            data_c_idx.append(c_idx)
+            data_sign.append(sign)
+        
+        current_ptr += len(conns)
+        indptr[r_idx+1] = current_ptr
+
+    # Convert to numpy arrays with optimal types
+    connections_csr = {
+        'indptr': indptr,
+        'indices_ii': np.array(indices_ii, dtype=idx_dtype),
+        'data_c_idx': np.array(data_c_idx, dtype=idx_dtype),
+        'data_sign': np.array(data_sign, dtype=np.int8) # Signs are +1/-1
+    }
+
+    return connections_csr, mask2idx_Nm, sorted_Nm_masks
+
+@njit(cache=True, nogil=True)
+def compute_rdm_chunk_from_csr(r_indices_chunk, C_idx_data, C_idx_indices, C_idx_indptr, C_sign_data, psi, D_m, rdm_dtype_np):
+    """
+    Numba-accelerated calculation of the RDM contribution using the CSR connection map.
+    This kernel is optimized for performance and handles sparse psi efficiently.
+    Releases the GIL to enable true parallel computation.
+    """
+    partial_rdm = np.zeros((D_m, D_m), dtype=rdm_dtype_np)
+    
+    # Iterate over r_idx (N-m states) in the chunk
+    for r_idx in r_indices_chunk:
+        
+        # Get the range of connections for this r_idx from CSR indptr
+        start = C_idx_indptr[r_idx]
+        end = C_idx_indptr[r_idx+1]
+        
+        # Iterate over pairs of connections (i, j) originating from the same r_idx.
+        # This nested loop structure computes RDM += Sum_r (V_r @ V_r^H) efficiently.
+        
+        for idx_i in range(start, end):
+            ii = C_idx_indices[idx_i]
+            c_idx_i = C_idx_data[idx_i]
+            sign_i = C_sign_data[idx_i]
+            
+            # Optimization: Skip if the state amplitude is zero (handles sparse psi)
+            if psi[c_idx_i] == 0:
+                continue
+            
+            # Calculate V_i(r) = psi[c_i] * sign_i
+            # Ensure type consistency
+            V_i = rdm_dtype_np(psi[c_idx_i] * sign_i)
+            
+            # Iterate over the second connection (j >= i) to leverage Hermitian symmetry
+            for idx_j in range(idx_i, end):
+                jj = C_idx_indices[idx_j]
+                c_idx_j = C_idx_data[idx_j]
+                sign_j = C_sign_data[idx_j]
+                
+                if psi[c_idx_j] == 0:
+                    continue
+
+                # Calculate V_j(r) = psi[c_j] * sign_j
+                V_j = rdm_dtype_np(psi[c_idx_j] * sign_j)
+                
+                # Contribution to RDM[ii, jj]
+                # RDM[i, j] = Sum_r V_i(r) * conj(V_j(r))
+                contribution = V_i * np.conj(V_j)
+                
+                partial_rdm[ii, jj] += contribution
+                
+                if idx_i != idx_j:
+                    # Add symmetric part RDM[jj, ii] = conj(contribution)
+                    partial_rdm[jj, ii] += np.conj(contribution)
+
+    return partial_rdm
+
+def _process_chunk_direct_rdm_opt(args):
+    """
+    Worker function wrapper for the optimized Numba kernel.
+    """
+    # r_indices_chunk_np is passed as a numpy array
+    r_indices_chunk_np, connections_csr, D_m, psi, rdm_dtype = args
+    
+    # Unpack CSR structure (These are compact NumPy arrays)
+    indptr = connections_csr['indptr']
+    indices_ii = connections_csr['indices_ii']
+    data_c_idx = connections_csr['data_c_idx']
+    data_sign = connections_csr['data_sign']
+    
+    # Get the numpy type object for Numba compatibility
+    rdm_dtype_np = np.dtype(rdm_dtype).type
+
+    # Call the Numba optimized function (which releases the GIL)
+    partial_rdm = compute_rdm_chunk_from_csr(
+        r_indices_chunk_np,
+        data_c_idx, indices_ii, indptr, data_sign,
+        psi, D_m, rdm_dtype_np
+    )
 
     return partial_rdm
 
 def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int | None = None) -> np.ndarray:
     """
     Directly calculates the m-body Reduced Density Matrix (M-RDM) for a given state psi.
-
-    This implementation bypasses the creation of the full 4-tensor operator arrays (rho_m_gen),
-    providing significant speedup and memory savings.
-    It uses optimized connection mapping, multiprocessing, and Numba acceleration.
     """
     if basis_N.num is None:
          raise ValueError("basis_N.num (N) must be set for RDM calculation.")
@@ -827,7 +909,7 @@ def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int
     m_basis = FixedBasis(D, num=m, pairs=basis_N.pairs) 
     D_m = m_basis.size
 
-    # Determine RDM dtype (matching logic in worker)
+    # Determine RDM dtype
     if psi.dtype.kind == 'c':
         rdm_dtype = np.complex128 if np.dtype(psi.dtype).itemsize < 16 else psi.dtype
     else:
@@ -838,56 +920,64 @@ def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int
         return np.zeros((D_m, D_m), dtype=rdm_dtype)
         
     if m == 0:
-        # Norm squared (Tr[rho])
         norm_sq = np.dot(np.conj(psi), psi)
         return np.array([[norm_sq]], dtype=rdm_dtype)
 
-    # 1. Pre-calculate indices for basis_N (Required by calculate_connections_v3)
+    # Pre-calculate indices for basis_N (Required for subset iteration)
     basis_indices = {}
     for mask_c in basis_N.bitmasks:
-        # Ensure mask_c is standard int and indices are sorted
         mask_c_int = int(mask_c)
+        # Ensure indices are sorted (crucial for correct sign calculation)
         basis_indices[mask_c_int] = sorted([i for i in range(D) if (mask_c_int >> i) & 1])
 
-    # 2. Calculate connections (Reuses the optimized logic from rho_m_gen)
-    # Note: calculate_connections_v3 internally uses USE_NUMBA for sign calculations.
-    connections, mask2idx_Nm, sorted_Nm_masks = calculate_connections_v3(
+    # Calculate connections using the optimized CSR function
+    # This avoids the creation of the large intermediate dictionary.
+    connections_csr, mask2idx_Nm, sorted_Nm_masks = calculate_connections_csr(
         basis_N, m_basis, D, basis_indices)
     
     D_Nm = len(sorted_Nm_masks)
-    if D_Nm == 0:
+    if D_Nm == 0 or connections_csr is None:
         return np.zeros((D_m, D_m), dtype=rdm_dtype)
 
-    # 3. Parallel computation (Multiprocessing + Numba workers)
+    # Parallel computation (Multiprocessing + Numba workers with GIL release)
     n_workers = _ensure_workers(n_workers)
     
     r_indices = np.arange(D_Nm)
     # Use significantly more chunks than workers for better load balancing
-    num_chunks = max(n_workers * 16, 1) 
+    num_chunks = max(n_workers * 32, 1)
     
     if D_Nm > 0:
-        chunks = np.array_split(r_indices, min(num_chunks, D_Nm))
+        # Split into numpy arrays directly
+        chunks_np = np.array_split(r_indices, min(num_chunks, D_Nm))
     else:
-        chunks = []
+        chunks_np = []
     
-    # Prepare iterable. Pass psi to the workers.
-    iterable = [(list(chunk), connections, D_m, psi) 
-                for chunk in chunks if len(chunk) > 0]
+    # Prepare iterable. Pass the compact CSR structure.
+    iterable = [(chunk_np, connections_csr, D_m, psi, rdm_dtype) 
+                for chunk_np in chunks_np if len(chunk_np) > 0]
 
-    description = f"RDM_{m} Direct (Numba)" if USE_NUMBA else f"RDM_{m} Direct (Python)"
+    description = f"RDM_{m} Direct (Optimized)"
+    
+    # Use the existing 'chunked' utility for parallel processing
     results = chunked(
-        _process_chunk_direct_rdm,
+        _process_chunk_direct_rdm_opt, # Use the optimized worker
         iterable,
         n_workers=n_workers,
         description=description,
     )
 
-    # 4. Merge results (Sum partial RDMs)
+    # Merge results (Sum partial RDMs)
+    if not results:
+        return np.zeros((D_m, D_m), dtype=rdm_dtype)
+
     RDM_m = np.sum(results, axis=0)
     
     # Final check for real input/output (numerical noise mitigation)
-    if np.isrealobj(psi) and np.isrealobj(RDM_m):
-        return RDM_m.real
-    else:
-        return RDM_m
-
+    if np.isrealobj(psi):
+        if RDM_m.dtype.kind == 'c':
+            # If input was real, RDM must be real. Discard numerical noise in imaginary part.
+            return RDM_m.real
+        else:
+            return RDM_m
+    
+    return RDM_m

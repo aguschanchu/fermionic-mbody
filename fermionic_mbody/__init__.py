@@ -17,6 +17,8 @@ from .rho import (
     rho_m_gen_legacy,
 )
 
+from . import datasets
+
 __all__ = [
     "FixedBasis",
     "rho_m_gen",
@@ -24,5 +26,7 @@ __all__ = [
     "rho_2_kkbar_gen",
     "rho_m",
     "rho_m_direct",
-    "rho_m_gen_legacy"
+    "rho_m_gen_legacy",
+    "datasets"
+
 ]
