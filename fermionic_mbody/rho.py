@@ -88,11 +88,11 @@ def subspace_aware(gen_fn):
 
 
 # =====================================================================
-# OPTIMIZED RHO_M_GEN IMPLEMENTATION 
+# RHO_M_GEN IMPLEMENTATION 
 # =====================================================================
 
 # ---------------------------------------------------------------------
-# Numba Optimized Helper Functions
+# Numba Helper Functions
 # ---------------------------------------------------------------------
 
 @njit(cache=True)
@@ -338,7 +338,7 @@ def rho_m_gen(
 
          
     # Ensure m_basis respects the same structure/restrictions if applicable
-    m_basis = FixedBasis(basis.d, num=m, pairs=basis.pairs) 
+    m_basis = FixedBasis(basis.d, num=m, pairs=False) 
     
     D_N = basis.size
     D_m = m_basis.size
@@ -448,7 +448,6 @@ def _process_m_chunk(
 
 
 # .....................................................................
-@subspace_aware
 def rho_m_gen_legacy(
     basis: FixedBasis, m: int, *, n_workers: int | None = None
 ) -> sparse.COO:
@@ -523,7 +522,8 @@ def _block_worker(
             op1 = of.FermionOperator(((2 * k, 1), (2 * l + 1, 1)))
 
             op = op1 * op2
-            mat = number_preserving_matrix(op, basis.d, basis.num).tocoo()
+            mat_N = number_preserving_matrix(op, basis.d, basis.num)
+            mat = restrict_sector_matrix(mat_N, basis.bitmasks, basis.d, basis.num).tocoo()
 
             rows, cols = mat.nonzero()
             for r, c, v in zip(rows, cols, mat.data):
@@ -533,7 +533,6 @@ def _block_worker(
     return indices, values
 
 # .....................................................................
-@subspace_aware
 def rho_2_block_gen(basis: FixedBasis, *, n_workers: int | None = None) -> sparse.COO:
     """
     Generate the pair-scattering block
@@ -622,7 +621,8 @@ def _kkbar_worker(
             op1 = of.FermionOperator(((2 * jj, 1), (2 * jj + 1, 1)))
 
             op = op1 * op2
-            mat = number_preserving_matrix(op, basis.d, basis.num).tocoo()
+            mat_N = number_preserving_matrix(op, basis.d, basis.num)
+            mat = restrict_sector_matrix(mat_N, basis.bitmasks, basis.d, basis.num).tocoo()
 
             rows, cols = mat.nonzero()
             for r, c, v in zip(rows, cols, mat.data):
@@ -633,7 +633,6 @@ def _kkbar_worker(
 
 
 # .....................................................................
-@subspace_aware
 def rho_2_kkbar_gen(basis: FixedBasis, *, n_workers: int | None = None) -> sparse.COO:
     """
     Generate the diagonal k \bar k block
@@ -906,7 +905,7 @@ def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int
     D = basis_N.d
     
     # Setup m-basis
-    m_basis = FixedBasis(D, num=m, pairs=basis_N.pairs) 
+    m_basis = FixedBasis(D, num=m, pairs=False) 
     D_m = m_basis.size
 
     # Determine RDM dtype

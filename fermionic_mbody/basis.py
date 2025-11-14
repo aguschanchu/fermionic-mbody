@@ -239,57 +239,69 @@ class FixedBasis:
         self.canonicals = np.eye(self.size)
         self._mask2idx_cache = {int(mask): idx for idx, mask in enumerate(self.bitmasks)}
 
+        if self.pairs and self.d % 2 != 0:
+            raise ValueError("Pairing restriction (pairs=True) requires an even number of modes (d).")
+
     # ................................................................. internal helpers
     def _create_basis(self) -> Tuple[List[of.FermionOperator], np.ndarray]:
         """Generate basis list + bit-mask array in ascending bitmask order."""
         basis, masks = [], []
 
-        # Case 1: Fixed particle number AND no pairing restriction 
-        if self.num is not None and not self.pairs:
+        # Case 1: Pairing restriction (pairs=True)
+        if self.pairs:
+            m_pairs = self.d // 2
+            
+            # Case 1a: Fixed N (Must be even, N=2P)
+            if self.num is not None:
+                if self.num < 0 or self.num > self.d or self.num % 2 != 0:
+                    return [], np.array([], dtype=np.int64)
+                
+                P = self.num // 2
+                # Iterate over C(d/2, P). Combinations yield sorted indices, ensuring ascending bitmasks.
+                for pair_indices in itertools.combinations(range(m_pairs), P):
+                    k = 0
+                    # Calculate the bitmask: pattern 11 (3) shifted to 2*p_idx.
+                    for p_idx in pair_indices:
+                        k |= (3 << (2 * p_idx))
+                    
+                    basis.append(self._det2op(k, self.d))
+                    masks.append(k)
+            
+            # Case 1b: Full paired Fock space (N not fixed)
+            else:
+                # Iterate over 2^(d/2) configurations of pairs.
+                for k_pair in range(1 << m_pairs):
+                    k = 0
+                    for i in range(m_pairs):
+                        if (k_pair >> i) & 1:
+                            k |= (3 << (2*i))
+                    
+                    basis.append(self._det2op(k, self.d))
+                    masks.append(k)
+
+            return basis, np.array(masks, dtype=np.int64)
+
+        # Case 2: No pairing restriction (pairs=False), Fixed N
+        if self.num is not None:
             if self.num < 0 or self.num > self.d:
                 return basis, np.array(masks, dtype=np.int64)
 
-            # 1. Generate all combinations
             temp_data = []
             for indices in itertools.combinations(range(self.d), self.num):
                 k = sum(1 << i for i in indices)
                 terms = tuple((i, 1) for i in indices)
                 temp_data.append((k, of.FermionOperator(terms)))
             
-            # 2. Sort by bitmask (k)
+            # Sort by bitmask (k)
             temp_data.sort(key=lambda x: x[0])
             
-            # 3. Unpack sorted data
             masks = [k for k, op in temp_data]
             basis = [op for k, op in temp_data]
             
             return basis, np.array(masks, dtype=np.int64)
 
-        # Case 2: Full Fock space OR pairing restriction (Iterate over 2^d)
+        # --- Fallback: Full unrestricted Fock space (pairs=False, num=None) ---
         for k in range(1 << self.d):  
-            if hasattr(int, 'bit_count'):
-                    count = k.bit_count()
-            else:
-                    count = bin(k).count("1")
-
-            # particle-number restriction?
-            if self.num is not None and count != self.num:
-                continue
-
-            # k / \bar k pairing restriction?
-            # Assumes interleaved ordering (0, \bar 0, 1, \bar 1, ...)
-            if self.pairs:
-                is_paired = True
-                for i in range(self.d // 2):
-                    bit_pair = (k >> (2*i)) & 3
-                    # Valid paired configurations are 00 (0) or 11 (3).
-                    if bit_pair == 1 or bit_pair == 2: # (01 or 10)
-                        is_paired = False
-                        break
-                
-                if not is_paired:
-                    continue
-
             basis.append(self._det2op(k, self.d))
             masks.append(k)
 
