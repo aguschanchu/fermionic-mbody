@@ -206,7 +206,7 @@ def calculate_fermionic_sign_python(mask_c: int, indices_i: Sequence[int]) -> in
         current_mask ^= (1 << idx)
     return sign
 
-def calculate_connections_v3(basis_N: FixedBasis, m_basis: FixedBasis, d: int, basis_N_indices: Dict[int, List[int]]):
+def calculate_connections_v3(basis_N: FixedBasis, m_basis: FixedBasis, d: int, basis_N_indices: Dict[int, List[int]], statistics: str = 'fermionic'):
     """
     Calculates the connection map using optimized subset iteration.
     Uses Numba signs if available.
@@ -248,13 +248,15 @@ def calculate_connections_v3(basis_N: FixedBasis, m_basis: FixedBasis, d: int, b
                 mask_r = mask_c ^ mask_i
                 r_idx = mask2idx_Nm[mask_r]
                 
-                # Calculate sign (Use Numba if available)
-                if USE_NUMBA:
-                    # Numba function expects numpy array (use int64 for safety)
-                    indices_i_np = np.array(indices_i_tuple, dtype=np.int64)
-                    sign = calculate_fermionic_sign_numba(mask_c, indices_i_np)
+                if statistics == 'bosonic':
+                    sign = 1
                 else:
-                    sign = calculate_fermionic_sign_python(mask_c, indices_i_tuple)
+                    if USE_NUMBA:
+                        # Numba function expects numpy array (use int64 for safety)
+                        indices_i_np = np.array(indices_i_tuple, dtype=np.int64)
+                        sign = calculate_fermionic_sign_numba(mask_c, indices_i_np)
+                    else:
+                        sign = calculate_fermionic_sign_python(mask_c, indices_i_tuple)
                 
                 connections[(r_idx, ii)] = (c_idx, sign)
     
@@ -322,15 +324,69 @@ def _process_chunk_connections_v3(args):
     return indices_np, values_np
 
 # ---------------------------------------------------------------------
+# Optimization helpers for paired systems (Isomorphism)
+# ---------------------------------------------------------------------
+
+def _rho_m_gen_paired_isomorphism(basis: FixedBasis, m: int, n_workers: int | None) -> sparse.COO:
+    """Handles the optimized RDM generator calculation for pairs=True using isomorphism."""
+    
+    # 1. Define the reduced system parameters
+    d_red = basis.d // 2
+    N = basis.num
+    P = None # Number of pairs (P=N/2)
+
+    if N is not None and N % 2 == 0:
+        P = N // 2
+    
+    # 2. Determine the dimensions of the resulting tensor.
+    D_N = basis.size
+    
+    # D_m corresponds to the m-pair basis size C(d/2, m).
+    try:
+        # Construct the reduced m-basis (standard fermionic) to get the size.
+        basis_m_red = FixedBasis(d_red, m, pairs=False)
+        D_m = basis_m_red.size
+    except Exception:
+        D_m = 0
+
+    shape = (D_m, D_m, D_N, D_N)
+
+    # 3. Handle edge cases
+    if D_N == 0 or D_m == 0 or m < 0:
+        return sparse.COO([], [], shape=shape)
+        
+    if m == 0:
+        # m=0 RDM is the identity tensor.
+        eye = sp_sparse.eye(D_N, dtype=float)
+        return sparse.COO(eye).reshape((1, 1, D_N, D_N))
+
+    # 4. Construct the reduced N-body basis (P particles in d/2 modes).
+    try:
+        basis_P_red = FixedBasis(d_red, P, pairs=False)
+    except Exception:
+        return sparse.COO([], [], shape=shape)
+
+    # 5. Critical check for isomorphism. The optimization relies on FixedBasis preserving the order.
+    if basis.size != basis_P_red.size:
+        raise RuntimeError(f"Isomorphism assumption failed. Paired basis size: {basis.size}, Reduced basis size: {basis_P_red.size}.")
+
+    # 6. Recursive call: Calculate the m-RDM in the reduced basis.
+    return rho_m_gen(basis_P_red, m, n_workers=n_workers, _statistics='bosonic')
+
+# ---------------------------------------------------------------------
 # generic ρ(m) tensor (Main function)
 # ---------------------------------------------------------------------
 
 def rho_m_gen(
-    basis: FixedBasis, m: int, *, n_workers: int | None = None
+    basis: FixedBasis, m: int, *, n_workers: int | None = None, _statistics: str = 'fermionic'
 ) -> sparse.COO:
     """
     Build the sparse ρ(m) tensor
     """
+
+    if basis.pairs and _statistics == 'fermionic':
+        return _rho_m_gen_paired_isomorphism(basis, m, n_workers=n_workers)
+
     if basis.num is None:
          raise ValueError("basis.num must be set for RDM generation.")
     if chunked is None:
@@ -360,7 +416,7 @@ def rho_m_gen(
 
     # 1. Calculate connections (Sequential, optimized with Numba signs if available)
     connections, mask2idx_Nm, sorted_Nm_masks = calculate_connections_v3(
-        basis, m_basis, basis.d, basis_indices)
+        basis, m_basis, basis.d, basis_indices, _statistics)
     
     D_Nm = len(sorted_Nm_masks)
     if D_Nm == 0:
@@ -641,6 +697,10 @@ def rho_2_kkbar_gen(basis: FixedBasis, *, n_workers: int | None = None) -> spars
 
     with shape (m, m, N_dim, N_dim where m = d // 2.
     """
+
+    if basis.pairs:
+        return rho_m_gen(basis, 1, n_workers=n_workers)
+
     m_pairs = basis.d // 2
     it_set = np.arange(m_pairs)
     n_workers = _ensure_workers(n_workers)
@@ -721,7 +781,7 @@ def rho_m(state: np.ndarray, rho_arrays: sparse.COO) -> sparse.COO:
 # DIRECT M-RDM CALCULATION 
 # =====================================================================
 
-def calculate_connections_csr(basis_N: FixedBasis, m_basis: FixedBasis, d: int, basis_N_indices: Dict[int, List[int]]):
+def calculate_connections_csr(basis_N: FixedBasis, m_basis: FixedBasis, d: int, basis_N_indices: Dict[int, List[int]], statistics: str = 'fermionic'):
     """
     Calculates the connection map and returns a CSR-like representation (dict of numpy arrays)
     """
@@ -773,8 +833,11 @@ def calculate_connections_csr(basis_N: FixedBasis, m_basis: FixedBasis, d: int, 
                 ii = mask2idx_m[mask_i]
                 mask_r = mask_c_int ^ mask_i
                 r_idx = mask2idx_Nm[mask_r]
-                indices_i_np = np.array(indices_i_tuple, dtype=np.int64)
-                sign = calculate_fermionic_sign_numba(mask_c_int, indices_i_np)
+                if statistics == 'bosonic':
+                    sign = 1
+                else:
+                    indices_i_np = np.array(indices_i_tuple, dtype=np.int64)
+                    sign = calculate_fermionic_sign_numba(mask_c_int, indices_i_np)
 
                 
                 connections_per_r[r_idx].append((ii, c_idx, sign))
@@ -891,10 +954,63 @@ def _process_chunk_direct_rdm_opt(args):
 
     return partial_rdm
 
-def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int | None = None) -> np.ndarray:
+def _rho_m_direct_paired_isomorphism(basis_N: FixedBasis, m: int, psi: np.ndarray, n_workers: int | None) -> np.ndarray:
+    """Handles optimized direct RDM calculation for pairs=True using isomorphism."""
+
+    # 1. Define the reduced system parameters
+    d_red = basis_N.d // 2
+    N = basis_N.num
+    P = None
+
+    if N is not None and N % 2 == 0:
+        P = N // 2
+    
+    # 2. Determine RDM dimensions (D_m for m-pair RDM)
+    try:
+        basis_m_red = FixedBasis(d_red, m, pairs=False)
+        D_m = basis_m_red.size
+    except Exception:
+        D_m = 0
+
+    # 3. Determine RDM dtype
+    if psi.dtype.kind == 'c':
+        rdm_dtype = np.complex128 if np.dtype(psi.dtype).itemsize < 16 else psi.dtype
+    else:
+        rdm_dtype = np.float64 if np.dtype(psi.dtype).itemsize < 8 else psi.dtype
+
+    # 4. Handle edge cases
+    if basis_N.size == 0 or D_m == 0 or m < 0:
+        return np.zeros((D_m, D_m), dtype=rdm_dtype)
+
+    if m == 0:
+        norm_sq = np.dot(np.conj(psi), psi)
+        return np.array([[norm_sq]], dtype=rdm_dtype)
+
+    # 5. Construct the reduced N-body basis (P particles).
+    try:
+        basis_P_red = FixedBasis(d_red, P, pairs=False)
+    except Exception:
+        return np.zeros((D_m, D_m), dtype=rdm_dtype)
+
+    # 6. Critical check for isomorphism.
+    if basis_N.size != basis_P_red.size:
+        raise RuntimeError(f"Isomorphism assumption failed in rho_m_direct. Paired basis size: {basis_N.size}, Reduced basis size: {basis_P_red.size}.")
+
+    # 7. Recursive call: psi remains the same as the basis ordering is preserved by the isomorphism.
+    return rho_m_direct(basis_P_red, m, psi, n_workers=n_workers, _statistics='bosonic')
+
+def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int | None = None, _statistics: str = 'fermionic') -> np.ndarray:
     """
     Directly calculates the m-body Reduced Density Matrix (M-RDM) for a given state psi.
     """
+
+    if psi.ndim != 1 or psi.shape[0] != basis_N.size:
+        raise ValueError(f"psi must be a 1D state vector matching the basis size {basis_N.size}.")
+
+    # Optimization for pairs=True
+    if basis_N.pairs and _statistics == 'fermionic':
+        return _rho_m_direct_paired_isomorphism(basis_N, m, psi, n_workers=n_workers)
+
     if basis_N.num is None:
          raise ValueError("basis_N.num (N) must be set for RDM calculation.")
     
@@ -932,7 +1048,7 @@ def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int
     # Calculate connections using the optimized CSR function
     # This avoids the creation of the large intermediate dictionary.
     connections_csr, mask2idx_Nm, sorted_Nm_masks = calculate_connections_csr(
-        basis_N, m_basis, D, basis_indices)
+        basis_N, m_basis, D, basis_indices, _statistics)
     
     D_Nm = len(sorted_Nm_masks)
     if D_Nm == 0 or connections_csr is None:
