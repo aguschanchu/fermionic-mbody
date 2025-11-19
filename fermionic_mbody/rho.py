@@ -2,6 +2,14 @@
 Generators for m-body reduced density-matrix tensors ρ(m), specialised
 pairing-blocks, and a convenience contraction helper rho_m.
 
+Conventions:
+We adopt the following conventions throughout the library (consistent with OpenFermion):
+- Basis Ordering: We use the Jordan-Wigner transformation with Little-Endian (LE) encoding.
+  Fixed-N sectors are ordered lexicographically.
+- M-body basis {|i⟩}: Defined by creation strings C†ᵢ = c†_{i₁}⋯c†_{iₘ} with i₁ < ⋯ < iₘ.
+- M-RDM Definition: RDM[i, j] = ⟨Ψ| C†ⱼ Cᵢ |Ψ⟩.
+- Generator Tensor T: T[i, j, k, l] = ⟨k| C†ⱼ Cᵢ |l⟩, where |k⟩, |l⟩ are N-body states.
+
 All heavy lifting is off-loaded to
 fermibasis._parallel.chunked, which wraps a multiprocessing.Pool.
 """
@@ -17,14 +25,11 @@ import sparse
 from multiprocessing import cpu_count
 from math import comb
 from functools import wraps
-import numba
-from numba import njit
 from scipy import sparse as sp_sparse
 
 from ._parallel import chunked
 from .basis import FixedBasis
-from ._ofsparse import number_preserving_matrix, restrict_sector_matrix, mask_to_index_map
-
+from ._ofsparse import number_preserving_matrix, restrict_sector_matrix, of_sector_bitmasks
 
 __all__ = [
     "rho_m_gen",
@@ -36,56 +41,34 @@ __all__ = [
     "rho_m_direct",
 ]
 
-USE_NUMBA = True
+# ---------------------------------------------------------------------
+# Numba configuration and imports
+# ---------------------------------------------------------------------
+
+try:
+    import numba
+    from numba import njit
+    USE_NUMBA = True
+except ImportError:
+    # If Numba is not installed, disable optimization and provide dummy decorators.
+    USE_NUMBA = False
+    def njit(*args, **kwargs):
+        def decorator(func):
+            if not hasattr(func, 'py_func'):
+                 func.py_func = func
+            return func
+        
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+             return decorator(args[0])
+        return decorator
 
 # ---------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------
+
 def _ensure_workers(n_workers: int | None) -> int:
     """Return a strictly positive worker count (defaults to all CPUs)."""
     return max(1, n_workers or cpu_count())
-
-
-def _restrict_last2(tensor, subset):
-    """
-    Keep rows/cols whose *full-sector* positions are listed in `subset`
-    (1-D int array).  Works for any tensor whose last two axes are the
-    N-body basis.
-
-    Implementation detail: slice **one axis at a time** so we never pass
-    more than one advanced index to sparse.COO.
-    """
-    subset = np.asarray(subset)
-
-    # 1) cut the last axis: …, full_dim  ->  …, k
-    tensor = tensor[(Ellipsis, subset)]             # ⇢ shape (..., full, k)
-
-    # 2) cut what is now the penultimate axis (was full_dim)
-    #    build an index tuple like  (..., subset, :)
-    nd  = tensor.ndim
-    idx = [slice(None)] * (nd - 2) + [subset, slice(None)]
-    return tensor[tuple(idx)]                       # ⇢ shape (..., k, k)
-    
-
-def subspace_aware(gen_fn):
-    """Make a ρ-generator work with restricted FixedBasis objects."""
-    @wraps(gen_fn)
-    def wrapper(basis, *args, **kw):
-        full_dim = comb(basis.d, basis.num)
-        if basis.size == full_dim:                 # full sector → original path
-            return gen_fn(basis, *args, **kw)
-
-        # --- expand to full sector -------------------------------------------------
-        from .basis import FixedBasis             # lazy import to avoid cycles
-        tensor_full = gen_fn(FixedBasis(basis.d, basis.num), *args, **kw)
-
-        # --- slice it back ---------------------------------------------------------
-        mapping = mask_to_index_map(basis.d, basis.num)
-        subset  = np.fromiter((mapping[m] for m in basis.bitmasks), int)
-        return _restrict_last2(tensor_full, subset)
-    return wrapper
-
-
 
 # =====================================================================
 # RHO_M_GEN IMPLEMENTATION 
@@ -95,37 +78,42 @@ def subspace_aware(gen_fn):
 # Numba Helper Functions
 # ---------------------------------------------------------------------
 
-@njit(cache=True)
-def popcount(n):
-    """Fast population count (number of set bits) using Numba."""
-    count = 0
-    n = int(n) # Ensure integer type
-    while n > 0:
-        n &= (n - 1) 
-        count += 1
-    return count
+def _popcount_python(n):
+    """Fast population count (number of set bits) using optimized methods."""
+    n = int(n) 
+    if hasattr(int, 'bit_count'):
+        return n.bit_count()
+    else:
+        count = 0
+        while n > 0:
+            n &= (n - 1) 
+            count += 1
+        return count
+
+# Apply njit decorator 
+popcount = njit(cache=True)(_popcount_python)
 
 @njit(cache=True)
 def calculate_fermionic_sign_numba(mask_c, indices_i: np.ndarray):
     """
-    Calculates the fermionic sign (Jordan-Wigner, LE convention) using Numba.
+    Calculates the fermionic sign (Jordan-Wigner, LE convention).
     indices_i must be a sorted numpy array.
     """
     sign = 1
-    current_mask = mask_c
+    current_mask = int(mask_c)
     
     # Apply operators sequentially (lowest index first)
     for idx in indices_i:
-        # 1. Calculate sign based on parity of electrons before idx
+        # Calculate sign based on parity of electrons before idx
         mask_before = (1 << idx) - 1
         
-        # Use optimized popcount
+        # Use unified optimized popcount
         count = popcount(current_mask & mask_before)
             
         if (count & 1) == 1: # Check parity (if odd)
             sign = -sign
             
-        # 2. Update the mask (annihilate electron at idx)
+        # Update the mask (annihilate electron at idx)
         current_mask ^= (1 << idx)
         
     return sign
@@ -189,23 +177,6 @@ def compute_rdm_contributions_numba(ii_arr, c_idx_arr, sign_arr, coord_dtype_np)
 # Python Helper Functions (Used if Numba is disabled or for setup)
 # ---------------------------------------------------------------------
 
-def calculate_fermionic_sign_python(mask_c: int, indices_i: Sequence[int]) -> int:
-    """Pure Python fermionic sign calculation (Fallback)."""
-    sign = 1
-    current_mask = mask_c
-    for idx in indices_i:
-        mask_before = (1 << idx) - 1
-        # Use optimized population count if available (Python 3.10+)
-        if hasattr(int, 'bit_count'):
-            count = (current_mask & mask_before).bit_count()
-        else:
-            count = bin(current_mask & mask_before).count('1')
-
-        if (count & 1) == 1:
-            sign = -sign
-        current_mask ^= (1 << idx)
-    return sign
-
 def calculate_connections_v3(basis_N: FixedBasis, m_basis: FixedBasis, d: int, basis_N_indices: Dict[int, List[int]], statistics: str = 'fermionic'):
     """
     Calculates the connection map using optimized subset iteration.
@@ -219,6 +190,7 @@ def calculate_connections_v3(basis_N: FixedBasis, m_basis: FixedBasis, d: int, b
     # Pass 1: Identify Nm_masks (Python loop, optimized by subset iteration)
     Nm_masks = set()
     for mask_c in basis_N.bitmasks:
+        mask_c = int(mask_c)
         indices_c = basis_N_indices[mask_c]
         # Iterate over all combinations of size m (subsets)
         for indices_i in itertools.combinations(indices_c, m):
@@ -229,13 +201,17 @@ def calculate_connections_v3(basis_N: FixedBasis, m_basis: FixedBasis, d: int, b
             if mask_i in mask2idx_m:
                 Nm_masks.add(mask_c ^ mask_i)
 
-    # Create mapping for (N-m) subspace (LE ascending order)
-    sorted_Nm_masks = sorted(list(Nm_masks))
+    # Create mapping for (N-m) subspace
+    Nm_order = of_sector_bitmasks(d, N - m)
+    Nm_set = {int(x) for x in Nm_masks}
+    sorted_Nm_masks = [int(x) for x in Nm_order if int(x) in Nm_set]
     mask2idx_Nm = {mask: idx for idx, mask in enumerate(sorted_Nm_masks)}
+
     
     # Pass 2: Calculate connections
     connections = {}
     for c_idx, mask_c in enumerate(basis_N.bitmasks):
+        mask_c = int(mask_c)
         indices_c = basis_N_indices[mask_c]
         
         for indices_i_tuple in itertools.combinations(indices_c, m):
@@ -251,12 +227,9 @@ def calculate_connections_v3(basis_N: FixedBasis, m_basis: FixedBasis, d: int, b
                 if statistics == 'bosonic':
                     sign = 1
                 else:
-                    if USE_NUMBA:
-                        # Numba function expects numpy array (use int64 for safety)
-                        indices_i_np = np.array(indices_i_tuple, dtype=np.int64)
-                        sign = calculate_fermionic_sign_numba(mask_c, indices_i_np)
-                    else:
-                        sign = calculate_fermionic_sign_python(mask_c, indices_i_tuple)
+                    indices_i_np = np.array(indices_i_tuple, dtype=np.int64)
+                    sign = calculate_fermionic_sign_numba(mask_c, indices_i_np)
+
                 
                 connections[(r_idx, ii)] = (c_idx, sign)
     
@@ -298,17 +271,8 @@ def _process_chunk_connections_v3(args):
         c_idx_arr = np.array(c_idx_list, dtype=coord_dtype_np)
         sign_arr = np.array(sign_list, dtype=np.int8) # Signs are +1/-1
 
-        # Call optimized function
-        if USE_NUMBA:
-            # Call the corrected Numba function (using pre-allocation)
-            indices_np, values_np = compute_rdm_contributions_numba(
-                ii_arr, c_idx_arr, sign_arr, coord_dtype_np)
-        else:
-            # Fallback to Python version (which now also uses pre-allocation)
-            # We access the original Python function underlying the Numba wrapper.
-            indices_np, values_np = compute_rdm_contributions_numba.py_func(
-                 ii_arr, c_idx_arr, sign_arr, coord_dtype_np)
-
+        indices_np, values_np = compute_rdm_contributions_numba(
+            ii_arr, c_idx_arr, sign_arr, coord_dtype_np)
         
         if indices_np.size > 0:
             indices_list.append(indices_np)
@@ -326,6 +290,19 @@ def _process_chunk_connections_v3(args):
 # ---------------------------------------------------------------------
 # Optimization helpers for paired systems (Isomorphism)
 # ---------------------------------------------------------------------
+
+def _paired_reduce_mask(mask_full: int, m_pairs: int) -> int:
+    """
+    Map a full d-mode paired mask (bits 2p, 2p+1) to a d/2-mode reduced mask:
+    bit p is 1 iff both bits (2p, 2p+1) are 1.
+    """
+    red = 0
+    for p in range(m_pairs):
+        a = (mask_full >> (2*p)) & 1
+        b = (mask_full >> (2*p + 1)) & 1
+        if (a & b) == 1:
+            red |= (1 << p)
+    return red
 
 def _rho_m_gen_paired_isomorphism(basis: FixedBasis, m: int, n_workers: int | None) -> sparse.COO:
     """Handles the optimized RDM generator calculation for pairs=True using isomorphism."""
@@ -371,7 +348,31 @@ def _rho_m_gen_paired_isomorphism(basis: FixedBasis, m: int, n_workers: int | No
         raise RuntimeError(f"Isomorphism assumption failed. Paired basis size: {basis.size}, Reduced basis size: {basis_P_red.size}.")
 
     # 6. Recursive call: Calculate the m-RDM in the reduced basis.
-    return rho_m_gen(basis_P_red, m, n_workers=n_workers, _statistics='bosonic')
+    T_red = rho_m_gen(basis_P_red, m, n_workers=n_workers, _statistics='bosonic')
+
+    D_N = basis.size
+    full_masks = [int(x) for x in basis.bitmasks]
+    red_masks  = [int(x) for x in basis_P_red.bitmasks]
+
+    # Build red_mask -> full_index via pairing reduction
+    m_pairs = basis.d // 2
+    red_to_full = {
+        _paired_reduce_mask(k_full, m_pairs): idx_full
+        for idx_full, k_full in enumerate(full_masks)
+    }
+    perm = np.array([red_to_full[k_red] for k_red in red_masks], dtype=np.int64)
+
+    # Fast path: identical order
+    if np.array_equal(perm, np.arange(D_N, dtype=np.int64)):
+        return T_red
+
+    # Remap last two axes (k,l) from reduced order to parent basis order
+    coords = T_red.coords
+    new_coords = np.vstack([coords[0],
+                            coords[1],
+                            perm[coords[2]],
+                            perm[coords[3]]])
+    return sparse.COO(new_coords, T_red.data, shape=T_red.shape)
 
 # ---------------------------------------------------------------------
 # generic ρ(m) tensor (Main function)
@@ -411,6 +412,7 @@ def rho_m_gen(
     # Pre-calculate indices for basis (Optimization for subset iteration)
     basis_indices = {}
     for mask_c in basis.bitmasks:
+        mask_c = int(mask_c)
         # Ensure indices are sorted (required for correct sign calculation)
         basis_indices[mask_c] = sorted([i for i in range(basis.d) if (mask_c >> i) & 1])
 
@@ -813,7 +815,9 @@ def calculate_connections_csr(basis_N: FixedBasis, m_basis: FixedBasis, d: int, 
                 Nm_masks.add(mask_c_int ^ mask_i)
 
     # Create mapping for (N-m) subspace
-    sorted_Nm_masks = sorted(list(Nm_masks))
+    Nm_order = of_sector_bitmasks(d, N - m)
+    Nm_set = {int(x) for x in Nm_masks}
+    sorted_Nm_masks = [int(x) for x in Nm_order if int(x) in Nm_set]
     mask2idx_Nm = {mask: idx for idx, mask in enumerate(sorted_Nm_masks)}
     D_Nm = len(sorted_Nm_masks)
 
@@ -919,7 +923,7 @@ def compute_rdm_chunk_from_csr(r_indices_chunk, C_idx_data, C_idx_indices, C_idx
                 
                 # Contribution to RDM[ii, jj]
                 # RDM[i, j] = Sum_r V_i(r) * conj(V_j(r))
-                contribution = V_i * np.conj(V_j)
+                contribution = np.conj(V_j) * V_i
                 
                 partial_rdm[ii, jj] += contribution
                 
@@ -997,7 +1001,20 @@ def _rho_m_direct_paired_isomorphism(basis_N: FixedBasis, m: int, psi: np.ndarra
         raise RuntimeError(f"Isomorphism assumption failed in rho_m_direct. Paired basis size: {basis_N.size}, Reduced basis size: {basis_P_red.size}.")
 
     # 7. Recursive call: psi remains the same as the basis ordering is preserved by the isomorphism.
-    return rho_m_direct(basis_P_red, m, psi, n_workers=n_workers, _statistics='bosonic')
+    full_masks = [int(x) for x in basis_N.bitmasks]
+    red_masks  = [int(x) for x in basis_P_red.bitmasks]
+
+    m_pairs = basis_N.d // 2
+    red_to_full = {
+        _paired_reduce_mask(k_full, m_pairs): idx_full
+        for idx_full, k_full in enumerate(full_masks)
+    }
+    perm = np.array([red_to_full[k_red] for k_red in red_masks], dtype=np.int64)
+
+    # psi_red[r] = psi_full[perm[r]]
+    psi_red = psi[perm] if not np.array_equal(perm, np.arange(basis_N.size)) else psi
+
+    return rho_m_direct(basis_P_red, m, psi_red, n_workers=n_workers, _statistics='bosonic')
 
 def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int | None = None, _statistics: str = 'fermionic') -> np.ndarray:
     """

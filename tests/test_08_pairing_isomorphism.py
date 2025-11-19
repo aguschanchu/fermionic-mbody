@@ -189,8 +189,16 @@ def test_physical_cross_validation(basis_paired, isomorphic_state):
     
     # We rely on FixedBasis(pairs=False) sorting bitmasks in ascending order.
     # We can efficiently find the indices using np.searchsorted.
-    standard_indices = np.searchsorted(basis_standard.bitmasks, basis_paired.bitmasks)
-    
+    index_of = {int(mask): idx for idx, mask in enumerate(basis_standard.bitmasks)}
+    try:
+        standard_indices = np.fromiter(
+            (index_of[int(m)] for m in basis_paired.bitmasks),
+            dtype=int,
+            count=basis_paired.size
+        )
+    except KeyError:
+        pytest.fail("Bitmask mismatch during state mapping (mask not found in standard basis).")    
+        
     # Verify the mapping is correct (masks should match)
     if not np.array_equal(basis_standard.bitmasks[standard_indices], basis_paired.bitmasks):
         pytest.fail("Bitmask mismatch during state mapping.")

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple, Dict
 from scipy import sparse as sp_sparse
 import itertools
-from ._ofsparse import number_preserving_matrix, restrict_sector_matrix
+from ._ofsparse import number_preserving_matrix, restrict_sector_matrix, of_sector_bitmasks, mask_to_index_map
 
 import numpy as np
 import openfermion as of
@@ -58,15 +58,18 @@ class FixedBasis:
     base: List[of.FermionOperator] = field(init=False, repr=False)
     bitmasks: np.ndarray = field(init=False, repr=False)
     size: int = field(init=False)
-    canonicals: np.ndarray = field(init=False, repr=False)
     _mask2idx_cache: Dict[int, int] = field(init=False, repr=False)
 
     # ---------------------------------------------------------------------
     # public helpers
     # ---------------------------------------------------------------------
-    def idx_to_repr(self, idx: int) -> np.ndarray:
-        """Return the canonical |e_idx⟩ vector in ℂ^size."""
-        return self.canonicals[idx]
+    def idx_to_repr(self, idx: int, dtype=np.float64) -> np.ndarray:
+        """Return the canonical |e_idx⟩ vector in C^size."""
+        if not (0 <= idx < self.size):
+            raise IndexError(f"Index {idx} out of bounds for basis size {self.size}.")
+        vec = np.zeros(self.size, dtype=dtype)
+        vec[idx] = 1.0
+        return vec
 
     @property
     def num_ele(self) -> np.ndarray:
@@ -76,7 +79,8 @@ class FixedBasis:
     def opr_to_idx(self, opr: of.FermionOperator) -> Optional[int]:
         """
         Return idx such that base[idx] equals opr once normal-ordered.
-        Requires opr to be a single creation string present in the basis.
+        Requires opr to be a single creation string present in the basis
+        with coefficient 1.
         """
         norm_op = of.transforms.normal_ordered(opr)
         
@@ -84,10 +88,16 @@ class FixedBasis:
         if len(norm_op.terms) != 1:
             return None
             
-        term = next(iter(norm_op.terms.keys()))
+        # Extract the single term and its coefficient
+        term, coeff = next(iter(norm_op.terms.items()))
 
         # Ensure creation only
         if any(cd != 1 for _, cd in term):
+            return None
+
+        # Check if the coefficient is 1 (within numerical tolerance).
+        # We must ensure equality including phase and magnitude.
+        if not np.isclose(coeff, 1.0):
             return None
 
         bitmask = sum(1 << i for i, _ in term)
@@ -97,22 +107,22 @@ class FixedBasis:
 
     def get_operator_matrix(self, op: of.FermionOperator) -> sp_sparse.spmatrix:
         """
-        Return the sparse matrix representation of op in this fixed basis.
-        O[i, j] = <e_i| op |e_j>.
+        Return the sparse matrix representation O[i, j] = <e_i| op |e_j>
+        in this fixed basis.
         """
         if self.num is not None:
-            # Efficient path for N-particle sector
             mat_N = number_preserving_matrix(op, self.d, self.num)
-            # Restrict to the subset defined by the basis
-            mat_restricted = restrict_sector_matrix(mat_N, self.bitmasks, self.d, self.num)
-            return mat_restricted
-        
-        # Fallback for full Fock space
+            # Fast path: if our bitmask order matches OF exactly, return as-is.
+            of_masks = of_sector_bitmasks(self.d, self.num)
+            if np.array_equal(self.bitmasks, of_masks):
+                return mat_N
+            # Otherwise, restrict/reorder to our subset order.
+            return restrict_sector_matrix(mat_N, self.bitmasks, self.d, self.num)
+
+        # Full Fock space
         mat_fock = of.get_sparse_operator(op, self.d)
         if self.size == (1 << self.d):
             return mat_fock
-        
-        # Extract submatrix using bitmasks as indices in Fock space
         indices = self.bitmasks
         return mat_fock[np.ix_(indices, indices)]
 
@@ -189,11 +199,11 @@ class FixedBasis:
 
             return vec
 
-    def vec_to_op(self, vec: np.ndarray) -> of.FermionOperator:
+    def vec_to_op(self, vec: np.ndarray, tol: float = 0.0) -> of.FermionOperator:
         op = of.FermionOperator()
         for idx, coeff in enumerate(vec):
-            if coeff != 0:
-                op += coeff * self.base[idx]
+            if abs(coeff) > tol:
+                op += complex(coeff) * self.base[idx]
         return op
 
     # ---------------------------------------------------------------------
@@ -219,8 +229,11 @@ class FixedBasis:
     @staticmethod
     def _det2op(det: int, n_qubits: int) -> of.FermionOperator:
         """
-        Convert an integer det into the
-        corresponding creation-operator string |vac⟩ → |det⟩
+        Convert an integer det into the corresponding creation-operator string 
+        |vac⟩ → |det⟩ using the Jordan-Wigner transformation (Little-Endian).
+        
+        The resulting operator creates the state with indices ordered increasingly:
+        c†_{i_1} c†_{i_2} ... |vac⟩ (i_1 < i_2 < ...).
         """
         terms = []
         for q in range(n_qubits):
@@ -236,76 +249,69 @@ class FixedBasis:
         """Populate internal tables after dataclass creation."""
         self.base, self.bitmasks = self._create_basis()
         self.size = len(self.base)
-        self.canonicals = np.eye(self.size)
         self._mask2idx_cache = {int(mask): idx for idx, mask in enumerate(self.bitmasks)}
 
         if self.pairs and self.d % 2 != 0:
             raise ValueError("Pairing restriction (pairs=True) requires an even number of modes (d).")
 
-    # ................................................................. internal helpers
+    # ................................................................. 
     def _create_basis(self) -> Tuple[List[of.FermionOperator], np.ndarray]:
-        """Generate basis list + bit-mask array in ascending bitmask order."""
-        basis, masks = [], []
+        """
+        Generate basis list + bit-mask array.
+        For fixed-N sectors, the order matches OpenFermion
+        """
+        basis: List[of.FermionOperator] = []
+        masks: List[int] = []
 
-        # Case 1: Pairing restriction (pairs=True)
+        # Pairs=True
         if self.pairs:
             m_pairs = self.d // 2
-            
-            # Case 1a: Fixed N (Must be even, N=2P)
             if self.num is not None:
-                if self.num < 0 or self.num > self.d or self.num % 2 != 0:
+                if self.num < 0 or self.num > self.d or (self.num % 2) != 0:
                     return [], np.array([], dtype=np.int64)
-                
-                P = self.num // 2
-                # Iterate over C(d/2, P). Combinations yield sorted indices, ensuring ascending bitmasks.
-                for pair_indices in itertools.combinations(range(m_pairs), P):
-                    k = 0
-                    # Calculate the bitmask: pattern 11 (3) shifted to 2*p_idx.
-                    for p_idx in pair_indices:
-                        k |= (3 << (2 * p_idx))
-                    
-                    basis.append(self._det2op(k, self.d))
-                    masks.append(k)
-            
-            # Case 1b: Full paired Fock space (N not fixed)
-            else:
-                # Iterate over 2^(d/2) configurations of pairs.
-                for k_pair in range(1 << m_pairs):
-                    k = 0
-                    for i in range(m_pairs):
-                        if (k_pair >> i) & 1:
-                            k |= (3 << (2*i))
-                    
-                    basis.append(self._det2op(k, self.d))
-                    masks.append(k)
 
-            return basis, np.array(masks, dtype=np.int64)
+                # Start from OF order and filter to paired states (00 or 11 per pair).
+                all_masks = of_sector_bitmasks(self.d, self.num)
+                def is_paired(mask: int) -> bool:
+                    for p in range(m_pairs):
+                        a = (mask >> (2*p)) & 1
+                        b = (mask >> (2*p + 1)) & 1
+                        if a != b:
+                            return False
+                    return True
 
-        # Case 2: No pairing restriction (pairs=False), Fixed N
-        if self.num is not None:
-            if self.num < 0 or self.num > self.d:
+                sel = [int(m) for m in all_masks if is_paired(int(m))]
+                for k in sel:
+                    masks.append(k)
+                    basis.append(self._det2op(k, self.d))
                 return basis, np.array(masks, dtype=np.int64)
 
-            temp_data = []
-            for indices in itertools.combinations(range(self.d), self.num):
-                k = sum(1 << i for i in indices)
-                terms = tuple((i, 1) for i in indices)
-                temp_data.append((k, of.FermionOperator(terms)))
-            
-            # Sort by bitmask (k)
-            temp_data.sort(key=lambda x: x[0])
-            
-            masks = [k for k, op in temp_data]
-            basis = [op for k, op in temp_data]
-            
+            # Full paired Fock subspace (no fixed N): enumerate 2^(d/2) pair-occupancies
+            for k_pair in range(1 << m_pairs):
+                k = 0
+                for i in range(m_pairs):
+                    if (k_pair >> i) & 1:
+                        k |= (3 << (2 * i))
+                masks.append(k)
+                basis.append(self._det2op(k, self.d))
             return basis, np.array(masks, dtype=np.int64)
 
-        # --- Fallback: Full unrestricted Fock space (pairs=False, num=None) ---
-        for k in range(1 << self.d):  
+        # No pairing
+        if self.num is not None:
+            if self.num < 0 or self.num > self.d:
+                return [], np.array([], dtype=np.int64)
+            of_masks = of_sector_bitmasks(self.d, self.num)
+            for k in of_masks:
+                kk = int(k)
+                masks.append(kk)
+                basis.append(self._det2op(kk, self.d))
+            return basis, np.array(masks, dtype=np.int64)
+
+        # Full Fock space in standard little-endian integer order
+        for k in range(1 << self.d):
             basis.append(self._det2op(k, self.d))
             masks.append(k)
-
-        return basis, np.array(masks, dtype=int)
+        return basis, np.array(masks, dtype=np.int64)
 
     # -----------------------------------------------------------------
     # alternate constructor: build a Basis from a subset of another one
@@ -344,7 +350,6 @@ class FixedBasis:
         new.size     = len(new.base)
         
         # Rebuild caches
-        new.canonicals = np.eye(new.size)
         new._mask2idx_cache = {int(mask): idx for idx, mask in enumerate(new.bitmasks)}
         
         return new
@@ -377,7 +382,6 @@ class FixedBasis:
         # rebuild every cache
         self.base   = [self._det2op(det, self.d) for det in self.bitmasks]
         self.size      = len(self.base)
-        self.canonicals = np.eye(self.size)
         self._mask2idx_cache = {int(mask): idx for idx, mask in enumerate(self.bitmasks)}
 
     # ---------------------------------------------------------------------
