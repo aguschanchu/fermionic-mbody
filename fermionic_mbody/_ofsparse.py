@@ -13,24 +13,25 @@ from itertools import combinations
 @lru_cache(maxsize=None)
 def of_sector_bitmasks(d: int, n: int) -> np.ndarray:
     """
-    Return an array of bitmasks for the N-particle sector basis, 
-    ordered lexicographically.
-    
-    This order matches the one used by OpenFermion's 
-    get_number_preserving_sparse_operator (when spin_preserving=False).
+    True OpenFermion fixed-N basis order via introspection.
+    Returns the array of bitmasks in the exact column/row order used by
+    openfermion.linalg.get_number_preserving_sparse_operator.
     """
     if not (0 <= n <= d):
         return np.array([], dtype=np.int64)
 
-    # In the LE convention, this naturally produces bitmasks in increasing numerical order.
-    masks = []
-    for indices in combinations(range(d), n):
-        mask = 0
-        for i in indices:
-            mask |= (1 << i)
-        masks.append(mask)
-        
-    return np.array(masks, dtype=np.int64)
+    # Weighted number operator: W = sum_i (2**i) * c_i^\dagger c_i
+    W = of.FermionOperator()
+    for i in range(d):
+        W += (1 << i) * of.FermionOperator(((i, 1), (i, 0)))
+
+    mat_W = of.linalg.get_number_preserving_sparse_operator(
+        W, num_qubits=d, num_electrons=n, spin_preserving=False
+    ).tocsc()
+
+    # The diagonal entries are the bitmasks in OpenFermion's basis order.
+    diag = np.asarray(mat_W.diagonal()).real.astype(np.int64)
+    return diag
 
 
 @lru_cache(maxsize=None)
