@@ -496,8 +496,7 @@ def _process_m_chunk(
     for ii in ii_chunk:
         for jj in range(m_basis.size):
             op = m_basis.base[jj] * of.utils.hermitian_conjugated(m_basis.base[ii])
-            mat = number_preserving_matrix(op, basis.d, basis.num)
-            mat = restrict_sector_matrix(mat, basis.bitmasks, basis.d, basis.num).tocoo()
+            mat = basis.get_operator_matrix(op).tocoo()
             rows, cols = mat.nonzero()
             indices.extend([[ii, jj, r, c] for r, c in zip(rows, cols)])
             values.extend(mat.data)
@@ -580,8 +579,7 @@ def _block_worker(
             op1 = of.FermionOperator(((2 * k, 1), (2 * l + 1, 1)))
 
             op = op1 * op2
-            mat_N = number_preserving_matrix(op, basis.d, basis.num)
-            mat = restrict_sector_matrix(mat_N, basis.bitmasks, basis.d, basis.num).tocoo()
+            mat = basis.get_operator_matrix(op).tocoo()
 
             rows, cols = mat.nonzero()
             for r, c, v in zip(rows, cols, mat.data):
@@ -679,8 +677,7 @@ def _kkbar_worker(
             op1 = of.FermionOperator(((2 * jj, 1), (2 * jj + 1, 1)))
 
             op = op1 * op2
-            mat_N = number_preserving_matrix(op, basis.d, basis.num)
-            mat = restrict_sector_matrix(mat_N, basis.bitmasks, basis.d, basis.num).tocoo()
+            mat = basis.get_operator_matrix(op).tocoo()
 
             rows, cols = mat.nonzero()
             for r, c, v in zip(rows, cols, mat.data):
