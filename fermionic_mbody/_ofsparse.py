@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from __future__ import annotations
 import numpy as np
 from scipy import sparse
 import openfermion as of
@@ -33,16 +34,11 @@ def of_sector_bitmasks(d: int, n: int) -> np.ndarray:
     diag = np.asarray(mat_W.diagonal()).real.astype(np.int64)
     return diag
 
-
 @lru_cache(maxsize=None)
 def mask_to_index_map(d: int, n: int) -> dict[int, int]:
-    """
-    Map bitmask -> position in OpenFermion's N-particle basis order
-    """
+    """Map bitmask -> position in OpenFermion's N-particle basis order."""
     masks = of_sector_bitmasks(d, n)
     return {int(m): int(i) for i, m in enumerate(masks)}
-
-
 
 def restrict_sector_matrix(mat: sparse.spmatrix,
                            subset_masks: np.ndarray,
@@ -69,17 +65,12 @@ def number_preserving_matrix(op: of.FermionOperator,
                              spin_preserving: bool = False
                              ) -> sparse.csc_matrix:
     """
-    Return the sparse matrix of op in the |N=n〉 sector
-    using the OpenFermion ordering (B_Asc)
+    Return the sparse matrix of op in the |N=n〉 sector.
     """
-    # Get matrix in B_Comb order from OpenFermion
     mat_comb = of.linalg.get_number_preserving_sparse_operator(
         op,
         num_qubits=d,
         num_electrons=n,
         spin_preserving=spin_preserving,
-        reference_determinant=None,
-        excitation_level=None,
     )
-
     return mat_comb.tocsc()

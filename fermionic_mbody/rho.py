@@ -79,16 +79,15 @@ def _ensure_workers(n_workers: int | None) -> int:
 # ---------------------------------------------------------------------
 
 def _popcount_python(n):
-    """Fast population count (number of set bits) using optimized methods."""
-    n = int(n) 
-    if hasattr(int, 'bit_count'):
-        return n.bit_count()
-    else:
-        count = 0
-        while n > 0:
-            n &= (n - 1) 
-            count += 1
-        return count
+    """
+    Fast population count (Numba compatible).
+    Replaces .bit_count() which is not always supported in nopython mode.
+    """
+    c = 0
+    while n > 0:
+        n &= (n - 1)
+        c += 1
+    return c
 
 # Apply njit decorator 
 popcount = njit(cache=True)(_popcount_python)
@@ -375,100 +374,117 @@ def _rho_m_gen_paired_isomorphism(basis: FixedBasis, m: int, n_workers: int | No
     return sparse.COO(new_coords, T_red.data, shape=T_red.shape)
 
 # ---------------------------------------------------------------------
-# generic ρ(m) tensor (Main function)
+# Optimized generator worker 
+# ---------------------------------------------------------------------
+
+def _process_chunk_gen_csr(args):
+    """
+    Worker for rho_m_gen using optimized CSR data structures.
+    Replaces _process_chunk_connections_v3.
+    """
+    r_indices_chunk, csr_data, D_m, coord_dtype = args
+    
+    indptr = csr_data['indptr']
+    indices_ii = csr_data['indices_ii']
+    data_c_idx = csr_data['data_c_idx']
+    data_sign = csr_data['data_sign']
+    
+    # Cast back to correct type for Numba
+    coord_dtype_np = np.dtype(coord_dtype).type
+    
+    indices_list = []
+    values_list = []
+
+    for r_idx in r_indices_chunk:
+        start = indptr[r_idx]
+        end = indptr[r_idx+1]
+        if start == end: continue
+            
+        ii_arr = indices_ii[start:end].astype(coord_dtype_np)
+        c_idx_arr = data_c_idx[start:end].astype(coord_dtype_np)
+        sign_arr = data_sign[start:end]
+
+        # Reuse the existing Numba kernel
+        idx_np, val_np = compute_rdm_contributions_numba(
+            ii_arr, c_idx_arr, sign_arr, coord_dtype_np)
+            
+        if idx_np.size > 0:
+            indices_list.append(idx_np)
+            values_list.append(val_np)
+
+    if not indices_list:
+        return np.empty((0, 4), dtype=coord_dtype), np.empty(0, dtype=float)
+        
+    return np.concatenate(indices_list, axis=0), np.concatenate(values_list, axis=0)
+
+# ---------------------------------------------------------------------
+# generic ρ(m) tensor
 # ---------------------------------------------------------------------
 
 def rho_m_gen(
     basis: FixedBasis, m: int, *, n_workers: int | None = None, _statistics: str = 'fermionic'
 ) -> sparse.COO:
     """
-    Build the sparse ρ(m) tensor
+    Build the sparse ρ(m) tensor.
     """
-
     if basis.pairs and _statistics == 'fermionic':
         return _rho_m_gen_paired_isomorphism(basis, m, n_workers=n_workers)
 
     if basis.num is None:
          raise ValueError("basis.num must be set for RDM generation.")
-    if chunked is None:
-         raise ImportError("rho_m_gen requires the _parallel module.")
 
-         
-    # Ensure m_basis respects the same structure/restrictions if applicable
-    m_basis = FixedBasis(basis.d, num=m, pairs=False) 
-    
+    m_basis = FixedBasis(basis.d, num=m, pairs=False)
     D_N = basis.size
     D_m = m_basis.size
     shape = (D_m, D_m, D_N, D_N)
 
-    # Handle edge cases
-    if m > basis.num or basis.num == 0 or m < 0:
-        return sparse.COO([], [], shape=shape)
-        
     if m == 0:
         eye = sp_sparse.eye(D_N, dtype=float)
         return sparse.COO(eye).reshape((1, 1, D_N, D_N))
 
-    # Pre-calculate indices for basis (Optimization for subset iteration)
-    basis_indices = {}
-    for mask_c in basis.bitmasks:
-        mask_c = int(mask_c)
-        # Ensure indices are sorted (required for correct sign calculation)
-        basis_indices[mask_c] = sorted([i for i in range(basis.d) if (mask_c >> i) & 1])
-
-    # 1. Calculate connections (Sequential, optimized with Numba signs if available)
-    connections, mask2idx_Nm, sorted_Nm_masks = calculate_connections_v3(
+    # 1. Calculate connections (Reuse the optimized CSR logic from direct solver)
+    # Ensure keys are sorted integers
+    basis_indices = {
+        int(m): sorted([i for i in range(basis.d) if (int(m) >> i) & 1]) 
+        for m in basis.bitmasks
+    }
+    
+    connections_csr, _, sorted_Nm_masks = calculate_connections_csr(
         basis, m_basis, basis.d, basis_indices, _statistics)
     
     D_Nm = len(sorted_Nm_masks)
     if D_Nm == 0:
         return sparse.COO([], [], shape=shape)
 
-    # Memory Optimization: Determine optimal integer type
-    max_dim = max(D_m, D_N)
-    if max_dim <= np.iinfo(np.int16).max:
-        coord_dtype = np.int16 # Sufficient for d=12
-    elif max_dim <= np.iinfo(np.int32).max:
-        coord_dtype = np.int32
-    else:
-        coord_dtype = np.int64
-
-    # 2. Parallel computation (Multiprocessing + Numba workers)
+    # 2. Parallel Processing
     n_workers = _ensure_workers(n_workers)
     
+    max_dim = max(D_m, D_N)
+    coord_dtype = np.int32 if max_dim <= 2**31 - 1 else np.int64
+
     r_indices = np.arange(D_Nm)
-    # Using more chunks improves load balancing
-    num_chunks = max(n_workers * 8, 1) 
-    chunks = np.array_split(r_indices, num_chunks)
+    chunks = np.array_split(r_indices, max(n_workers * 8, 1))
     
-    # Prepare iterable. 
-    iterable = [(list(chunk), connections, D_m, coord_dtype) 
+    iterable = [(chunk, connections_csr, D_m, coord_dtype) 
                 for chunk in chunks if len(chunk) > 0]
 
-    description = f"ρ_{m}" if USE_NUMBA else f"ρ_{m}"
     results = chunked(
-        _process_chunk_connections_v3,
+        _process_chunk_gen_csr,
         iterable,
         n_workers=n_workers,
-        description=description,
+        description=f"ρ_{m}",
     )
 
-    # 3. Merge results
-    idx_chunks = []
-    val_chunks = []
-    for idx_np, val_np in results:
-        if idx_np.size > 0:
-            idx_chunks.append(idx_np)
-            val_chunks.append(val_np)
+    # 3. Merge
+    idx_chunks = [r[0] for r in results if r[0].size > 0]
+    val_chunks = [r[1] for r in results if r[0].size > 0]
 
     if not idx_chunks:
         return sparse.COO([], [], shape=shape)
 
-    # Final concatenation
     coords_T = np.concatenate(idx_chunks, axis=0).T
     data = np.concatenate(val_chunks, axis=0)
     
-    # sparse.COO handles duplicate coordinates by summing them (required by this approach).
     return sparse.COO(coords_T, data, shape=shape)
 
 # ---------------------------------------------------------------------

@@ -75,7 +75,7 @@ def test_rho_m_contraction_density_matrix(basis_4_2, random_state):
     
     # CRITICAL FIX: Calculate the expectation value using element-wise product and sum.
     # value_from_rdm = np.trace(O_matrix @ rho1) # INCORRECT: Calculates Tr[O ρ₁ᵀ]
-    value_from_rdm = np.sum(O_matrix * rho1)
+    value_from_rdm = np.einsum('ij,ij', O_matrix, rho1)
 
     # Verify consistency
     assert np.isclose(value_from_rdm, expected_value)

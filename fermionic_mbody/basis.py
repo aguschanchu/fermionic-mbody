@@ -77,33 +77,24 @@ class FixedBasis:
 
     # .....................................................................
     def opr_to_idx(self, opr: of.FermionOperator) -> Optional[int]:
-        """
-        Return idx such that base[idx] equals opr once normal-ordered.
-        Requires opr to be a single creation string present in the basis
-        with coefficient 1.
-        """
-        norm_op = of.transforms.normal_ordered(opr)
-        
-        # Check if empty or multiple terms
-        if len(norm_op.terms) != 1:
-            return None
+            """
+            Return idx such that base[idx] == opr (ignoring global phase).
+            """
+            norm_op = of.transforms.normal_ordered(opr)
             
-        # Extract the single term and its coefficient
-        term, coeff = next(iter(norm_op.terms.items()))
+            if len(norm_op.terms) != 1:
+                return None
+                
+            term, coeff = next(iter(norm_op.terms.items()))
 
-        # Ensure creation only
-        if any(cd != 1 for _, cd in term):
-            return None
+            if any(cd != 1 for _, cd in term):
+                return None
 
-        # Check if the coefficient is 1 (within numerical tolerance).
-        # We must ensure equality including phase and magnitude.
-        if not np.isclose(coeff, 1.0):
-            return None
+            if not np.isclose(abs(coeff), 1.0):
+                return None
 
-        bitmask = sum(1 << i for i, _ in term)
-
-        # Use the cached internal mapping
-        return self._mask2idx_cache.get(bitmask)
+            bitmask = sum(1 << i for i, _ in term)
+            return self._mask2idx_cache.get(bitmask)
 
     def get_operator_matrix(self, op: of.FermionOperator) -> sp_sparse.spmatrix:
         """
@@ -246,72 +237,62 @@ class FixedBasis:
     # internal machinery
     # ---------------------------------------------------------------------
     def __post_init__(self) -> None:  
-        """Populate internal tables after dataclass creation."""
+        if self.pairs and self.d % 2 != 0:
+            raise ValueError("Pairing restriction (pairs=True) requires an even number of modes (d).")
+            
         self.base, self.bitmasks = self._create_basis()
         self.size = len(self.base)
         self._mask2idx_cache = {int(mask): idx for idx, mask in enumerate(self.bitmasks)}
 
-        if self.pairs and self.d % 2 != 0:
-            raise ValueError("Pairing restriction (pairs=True) requires an even number of modes (d).")
-
-    # ................................................................. 
     def _create_basis(self) -> Tuple[List[of.FermionOperator], np.ndarray]:
         """
         Generate basis list + bit-mask array.
-        For fixed-N sectors, the order matches OpenFermion
         """
-        basis: List[of.FermionOperator] = []
-        masks: List[int] = []
+        masks_list: List[int] = []
 
-        # Pairs=True
-        if self.pairs:
-            m_pairs = self.d // 2
-            if self.num is not None:
-                if self.num < 0 or self.num > self.d or (self.num % 2) != 0:
-                    return [], np.array([], dtype=np.int64)
-
-                # Start from OF order and filter to paired states (00 or 11 per pair).
-                all_masks = of_sector_bitmasks(self.d, self.num)
-                def is_paired(mask: int) -> bool:
-                    for p in range(m_pairs):
-                        a = (mask >> (2*p)) & 1
-                        b = (mask >> (2*p + 1)) & 1
-                        if a != b:
-                            return False
-                    return True
-
-                sel = [int(m) for m in all_masks if is_paired(int(m))]
-                for k in sel:
-                    masks.append(k)
-                    basis.append(self._det2op(k, self.d))
-                return basis, np.array(masks, dtype=np.int64)
-
-            # Full paired Fock subspace (no fixed N): enumerate 2^(d/2) pair-occupancies
-            for k_pair in range(1 << m_pairs):
-                k = 0
-                for i in range(m_pairs):
-                    if (k_pair >> i) & 1:
-                        k |= (3 << (2 * i))
-                masks.append(k)
-                basis.append(self._det2op(k, self.d))
-            return basis, np.array(masks, dtype=np.int64)
-
-        # No pairing
+        # 1. Generate Raw Masks
         if self.num is not None:
+            # Validate
             if self.num < 0 or self.num > self.d:
                 return [], np.array([], dtype=np.int64)
-            of_masks = of_sector_bitmasks(self.d, self.num)
-            for k in of_masks:
-                kk = int(k)
-                masks.append(kk)
-                basis.append(self._det2op(kk, self.d))
-            return basis, np.array(masks, dtype=np.int64)
+            if self.pairs and (self.num % 2 != 0):
+                return [], np.array([], dtype=np.int64)
 
-        # Full Fock space in standard little-endian integer order
-        for k in range(1 << self.d):
-            basis.append(self._det2op(k, self.d))
-            masks.append(k)
-        return basis, np.array(masks, dtype=np.int64)
+            # Use optimized helper
+            raw_masks = of_sector_bitmasks(self.d, self.num)
+            
+            if self.pairs:
+                m_pairs = self.d // 2
+                for m in raw_masks:
+                    m = int(m)
+                    # Check pairing: XOR bits 2p and 2p+1 must be 0
+                    is_paired = True
+                    for p in range(m_pairs):
+                        if ((m >> (2*p)) & 1) != ((m >> (2*p+1)) & 1):
+                            is_paired = False
+                            break
+                    if is_paired:
+                        masks_list.append(m)
+            else:
+                masks_list = [int(m) for m in raw_masks]
+        
+        else:
+            # Full Fock Space
+            if self.pairs:
+                m_pairs = self.d // 2
+                for k_pair in range(1 << m_pairs):
+                    k = 0
+                    for i in range(m_pairs):
+                        if (k_pair >> i) & 1:
+                            k |= (3 << (2 * i))
+                    masks_list.append(k)
+            else:
+                masks_list = list(range(1 << self.d))
+
+        masks_arr = np.array(masks_list, dtype=np.int64)
+        
+        basis = [self._det2op(k, self.d) for k in masks_list]
+        return basis, masks_arr
 
     # -----------------------------------------------------------------
     # alternate constructor: build a Basis from a subset of another one
