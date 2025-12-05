@@ -23,29 +23,14 @@ def chunked(
     *,
     n_workers: int | None = None,
     description: str | None = None,
+    # Add initialization support
+    initializer: Callable[..., None] | None = None,
+    initargs: tuple[Any, ...] = (),
 ) -> list[R]:
-    """
-    Map fn over iterable in parallel and return the collected list.
-
-    Parameters
-    ----------
-    fn
-        Function executed in each worker.
-    iterable
-        Sequence of arguments to feed `fn`.
-    n_workers
-        Number of worker processes (`cpu_count()` by default).
-    description
-        Optional description for the progress bar.
-
-    Returns
-    -------
-    list
-        The list [fn(x) for x in iterable] with order preserved.
-    """
     n_workers = n_workers or cpu_count()
 
-    with Pool(n_workers) as pool:
+    # Pass initializer to the Pool
+    with Pool(n_workers, initializer=initializer, initargs=initargs) as pool:
         results = list(
             tqdm(
                 pool.imap(fn, iterable),
@@ -53,5 +38,4 @@ def chunked(
                 desc=description or fn.__name__,
             )
         )
-
     return results

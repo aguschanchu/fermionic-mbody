@@ -870,7 +870,7 @@ def calculate_connections_csr(basis_N: FixedBasis, m_basis: FixedBasis, d: int, 
     for r_idx in range(D_Nm):
         conns = connections_per_r[r_idx]
         # Sorting by ii improves memory access patterns in the kernel
-        conns.sort(key=lambda x: x[0])
+        conns.sort(key=lambda x: x[1])
         
         for ii, c_idx, sign in conns:
             indices_ii.append(ii)
@@ -1029,6 +1029,39 @@ def _rho_m_direct_paired_isomorphism(basis_N: FixedBasis, m: int, psi: np.ndarra
 
     return rho_m_direct(basis_P_red, m, psi_red, n_workers=n_workers, _statistics='bosonic')
 
+# Global context to hold read-only data in worker processes
+_DIRECT_CTX = {}
+
+def _init_direct_worker(psi, indptr, indices, data, signs, D_m, dtype):
+    """Initializer: Stores heavy data in global scope once upon worker startup."""
+    _DIRECT_CTX['psi'] = psi
+    _DIRECT_CTX['indptr'] = indptr
+    _DIRECT_CTX['indices'] = indices
+    _DIRECT_CTX['data'] = data
+    _DIRECT_CTX['signs'] = signs
+    _DIRECT_CTX['D_m'] = D_m
+    _DIRECT_CTX['dtype'] = dtype
+
+def _process_chunk_direct_rdm_opt(r_indices_chunk_np):
+    """Worker: Receives ONLY indices. Retrieves heavy data from global context."""
+    # Retrieve data (Zero-Copy on Linux, Copy-Once on Spawn)
+    psi = _DIRECT_CTX['psi']
+    indptr = _DIRECT_CTX['indptr']
+    indices = _DIRECT_CTX['indices']
+    data = _DIRECT_CTX['data']
+    signs = _DIRECT_CTX['signs']
+    D_m = _DIRECT_CTX['D_m']
+    rdm_dtype = _DIRECT_CTX['dtype']
+    
+    rdm_dtype_np = np.dtype(rdm_dtype).type
+
+    # Call the Numba kernel
+    return compute_rdm_chunk_from_csr(
+        r_indices_chunk_np,
+        data, indices, indptr, signs,
+        psi, D_m, rdm_dtype_np
+    )
+
 def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int | None = None, _statistics: str = 'fermionic') -> np.ndarray:
     """
     Directly calculates the m-body Reduced Density Matrix (M-RDM) for a given state psi.
@@ -1097,18 +1130,27 @@ def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int
     else:
         chunks_np = []
     
-    # Prepare iterable. Pass the compact CSR structure.
-    iterable = [(chunk_np, connections_csr, D_m, psi, rdm_dtype) 
-                for chunk_np in chunks_np if len(chunk_np) > 0]
+    c_indptr = connections_csr['indptr']
+    c_indices = connections_csr['indices_ii']
+    c_data = connections_csr['data_c_idx']
+    c_signs = connections_csr['data_sign']
 
-    description = f"RDM_{m} Direct (Optimized)"
+    # Pack heavy arguments for the initializer
+    init_args = (psi, c_indptr, c_indices, c_data, c_signs, D_m, rdm_dtype)
+
+    # Iterable now contains ONLY the lightweight chunk indices
+    iterable = [c for c in chunks_np if c.size > 0]
+
+    description = f"RDM_{m} Direct"
     
     # Use the existing 'chunked' utility for parallel processing
     results = chunked(
-        _process_chunk_direct_rdm_opt, # Use the optimized worker
+        _process_chunk_direct_rdm_opt,
         iterable,
         n_workers=n_workers,
         description=description,
+        initializer=_init_direct_worker, # Pass initializer
+        initargs=init_args
     )
 
     # Merge results (Sum partial RDMs)
