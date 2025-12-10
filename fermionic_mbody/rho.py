@@ -1064,9 +1064,8 @@ def _process_chunk_direct_rdm_opt(r_indices_chunk_np):
 
 def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int | None = None, _statistics: str = 'fermionic') -> np.ndarray:
     """
-    Directly calculates the m-body Reduced Density Matrix (M-RDM) for a given state psi.
+    Directly calculates the m-body RDM using vectorized sparse matrix algebra.
     """
-
     if psi.ndim != 1 or psi.shape[0] != basis_N.size:
         raise ValueError(f"psi must be a 1D state vector matching the basis size {basis_N.size}.")
 
@@ -1076,95 +1075,60 @@ def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int
 
     if basis_N.num is None:
          raise ValueError("basis_N.num (N) must be set for RDM calculation.")
-    
-    if psi.ndim != 1 or psi.shape[0] != basis_N.size:
-        raise ValueError(f"psi must be a 1D state vector matching the basis size {basis_N.size}.")
 
-    N = basis_N.num
-    D = basis_N.d
-    
-    # Setup m-basis
-    m_basis = FixedBasis(D, num=m, pairs=False) 
+    # Setup Basis and Dtypes
+    m_basis = FixedBasis(basis_N.d, num=m, pairs=False) 
     D_m = m_basis.size
 
-    # Determine RDM dtype
     if psi.dtype.kind == 'c':
         rdm_dtype = np.complex128 if np.dtype(psi.dtype).itemsize < 16 else psi.dtype
     else:
         rdm_dtype = np.float64 if np.dtype(psi.dtype).itemsize < 8 else psi.dtype
 
-    # Handle edge cases
-    if m > N or N == 0 or m < 0:
+    # Edge Cases
+    if m > basis_N.num or basis_N.num == 0 or m < 0:
         return np.zeros((D_m, D_m), dtype=rdm_dtype)
-        
     if m == 0:
-        norm_sq = np.dot(np.conj(psi), psi)
-        return np.array([[norm_sq]], dtype=rdm_dtype)
+        return np.array([[np.dot(np.conj(psi), psi)]], dtype=rdm_dtype)
 
-    # Pre-calculate indices for basis_N (Required for subset iteration)
-    basis_indices = {}
-    for mask_c in basis_N.bitmasks:
-        mask_c_int = int(mask_c)
-        # Ensure indices are sorted (crucial for correct sign calculation)
-        basis_indices[mask_c_int] = sorted([i for i in range(D) if (mask_c_int >> i) & 1])
-
-    # Calculate connections using the optimized CSR function
-    # This avoids the creation of the large intermediate dictionary.
-    connections_csr, mask2idx_Nm, sorted_Nm_masks = calculate_connections_csr(
-        basis_N, m_basis, D, basis_indices, _statistics)
+    # Calculate Connections (Structure of V)
+    basis_indices = {
+        int(m): sorted([i for i in range(basis_N.d) if (int(m) >> i) & 1]) 
+        for m in basis_N.bitmasks
+    }
+    connections_csr, _, sorted_Nm_masks = calculate_connections_csr(
+        basis_N, m_basis, basis_N.d, basis_indices, _statistics)
     
     D_Nm = len(sorted_Nm_masks)
     if D_Nm == 0 or connections_csr is None:
         return np.zeros((D_m, D_m), dtype=rdm_dtype)
 
-    # Parallel computation (Multiprocessing + Numba workers with GIL release)
-    n_workers = _ensure_workers(n_workers)
+    # Construct the Sparse Transition Matrix V
+    # V[r, i] = <r| C_i |Psi> = Psi[c_idx] * sign
     
-    r_indices = np.arange(D_Nm)
-    # Use significantly more chunks than workers for better load balancing
-    num_chunks = max(n_workers * 32, 1)
-    
-    if D_Nm > 0:
-        # Split into numpy arrays directly
-        chunks_np = np.array_split(r_indices, min(num_chunks, D_Nm))
-    else:
-        chunks_np = []
-    
-    c_indptr = connections_csr['indptr']
-    c_indices = connections_csr['indices_ii']
-    c_data = connections_csr['data_c_idx']
-    c_signs = connections_csr['data_sign']
+    indptr = connections_csr['indptr']
+    indices = connections_csr['indices_ii']     
+    c_idx_data = connections_csr['data_c_idx']  #
+    sign_data = connections_csr['data_sign']
 
-    # Pack heavy arguments for the initializer
-    init_args = (psi, c_indptr, c_indices, c_data, c_signs, D_m, rdm_dtype)
-
-    # Iterable now contains ONLY the lightweight chunk indices
-    iterable = [c for c in chunks_np if c.size > 0]
-
-    description = f"RDM_{m} Direct"
+    # Vectorized lookup
+    V_data = psi[c_idx_data] * sign_data
     
-    # Use the existing 'chunked' utility for parallel processing
-    results = chunked(
-        _process_chunk_direct_rdm_opt,
-        iterable,
-        n_workers=n_workers,
-        description=description,
-        initializer=_init_direct_worker, # Pass initializer
-        initargs=init_args
+    # Create V
+    V = sp_sparse.csr_matrix(
+        (V_data, indices, indptr), 
+        shape=(D_Nm, D_m),
+        dtype=rdm_dtype
     )
 
-    # Merge results (Sum partial RDMs)
-    if not results:
-        return np.zeros((D_m, D_m), dtype=rdm_dtype)
-
-    RDM_m = np.sum(results, axis=0)
+    # Compute RDM = V^T @ V*
+    # Result is dense (D_m x D_m)
+    RDM_sparse = V.T @ V.conj()
     
-    # Final check for real input/output (numerical noise mitigation)
-    if np.isrealobj(psi):
-        if RDM_m.dtype.kind == 'c':
-            # If input was real, RDM must be real. Discard numerical noise in imaginary part.
-            return RDM_m.real
-        else:
-            return RDM_m
+    RDM_m = RDM_sparse.toarray()
+
+    # Final Cleanup
+    if np.isrealobj(psi) and RDM_m.dtype.kind == 'c':
+        return RDM_m.real
     
     return RDM_m
