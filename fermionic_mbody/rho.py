@@ -1064,38 +1064,42 @@ def _process_chunk_direct_rdm_opt(r_indices_chunk_np):
 
 def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int | None = None, _statistics: str = 'fermionic') -> np.ndarray:
     """
-    Directly calculates the m-body RDM using vectorized sparse matrix algebra.
+    Directly calculates the m-body RDM using vectorized linear algebra.
+    Switches between Sparse and Dense BLAS based on memory availability.
     """
+    # Validation and Isomorphism
     if psi.ndim != 1 or psi.shape[0] != basis_N.size:
         raise ValueError(f"psi must be a 1D state vector matching the basis size {basis_N.size}.")
 
-    # Optimization for pairs=True
     if basis_N.pairs and _statistics == 'fermionic':
         return _rho_m_direct_paired_isomorphism(basis_N, m, psi, n_workers=n_workers)
 
     if basis_N.num is None:
          raise ValueError("basis_N.num (N) must be set for RDM calculation.")
 
-    # Setup Basis and Dtypes
+    # Setup Dimensions and Types
     m_basis = FixedBasis(basis_N.d, num=m, pairs=False) 
     D_m = m_basis.size
-
-    if psi.dtype.kind == 'c':
-        rdm_dtype = np.complex128 if np.dtype(psi.dtype).itemsize < 16 else psi.dtype
-    else:
-        rdm_dtype = np.float64 if np.dtype(psi.dtype).itemsize < 8 else psi.dtype
+    
+    is_complex = (psi.dtype.kind == 'c')
+    rdm_dtype = np.complex128 if is_complex or np.dtype(psi.dtype).itemsize >= 16 else np.float64
+    if not is_complex and np.dtype(psi.dtype).itemsize < 8:
+        rdm_dtype = np.float64
 
     # Edge Cases
     if m > basis_N.num or basis_N.num == 0 or m < 0:
         return np.zeros((D_m, D_m), dtype=rdm_dtype)
     if m == 0:
-        return np.array([[np.dot(np.conj(psi), psi)]], dtype=rdm_dtype)
+        norm_sq = np.vdot(psi, psi)
+        return np.array([[norm_sq]], dtype=rdm_dtype)
 
-    # Calculate Connections (Structure of V)
+    # Build Connectivity Map 
     basis_indices = {
         int(m): sorted([i for i in range(basis_N.d) if (int(m) >> i) & 1]) 
         for m in basis_N.bitmasks
     }
+    
+    # connections_csr maps Environment-Rows (r) -> System-Cols (i)
     connections_csr, _, sorted_Nm_masks = calculate_connections_csr(
         basis_N, m_basis, basis_N.d, basis_indices, _statistics)
     
@@ -1103,32 +1107,51 @@ def rho_m_direct(basis_N: FixedBasis, m: int, psi: np.ndarray, *, n_workers: int
     if D_Nm == 0 or connections_csr is None:
         return np.zeros((D_m, D_m), dtype=rdm_dtype)
 
-    # Construct the Sparse Transition Matrix V
-    # V[r, i] = <r| C_i |Psi> = Psi[c_idx] * sign
-    
+    # Construct Sparse Matrix V
+    # V[r, i] corresponds to <r| C_i |Psi>
     indptr = connections_csr['indptr']
     indices = connections_csr['indices_ii']     
-    c_idx_data = connections_csr['data_c_idx']  #
+    c_idx_data = connections_csr['data_c_idx']
     sign_data = connections_csr['data_sign']
 
-    # Vectorized lookup
+    # Vectorized gather of wavefunction amplitudes
     V_data = psi[c_idx_data] * sign_data
     
-    # Create V
-    V = sp_sparse.csr_matrix(
+    # Use CSR for construction
+    V_sparse = sp_sparse.csr_matrix(
         (V_data, indices, indptr), 
         shape=(D_Nm, D_m),
         dtype=rdm_dtype
     )
 
-    # Compute RDM = V^T @ V*
-    # Result is dense (D_m x D_m)
-    RDM_sparse = V.T @ V.conj()
-    
-    RDM_m = RDM_sparse.toarray()
+    V_sparse.eliminate_zeros()
+
+    # Contraction: RDM = V^T @ V*
+    # Hybrid Dense/Sparse Strategy
+    memory_estimate_bytes = D_Nm * D_m * np.dtype(rdm_dtype).itemsize
+    MEMORY_LIMIT = 64 * 1024**3  # Set a safe limit (e.g., 4 GB)
+
+    if memory_estimate_bytes < MEMORY_LIMIT:
+        try:
+            # Dense BLAS (Multithreaded via MKL/OpenBLAS) --
+            V_dense = V_sparse.toarray()
+            
+            if np.iscomplexobj(V_dense):
+                RDM_m = V_dense.T @ V_dense.conj()
+            else:
+                RDM_m = V_dense.T @ V_dense
+                
+        except MemoryError:
+            # Fallback if allocation fails unexpectedly
+            RDM_sparse = V_sparse.T @ V_sparse.conj()
+            RDM_m = RDM_sparse.toarray()
+    else:
+        # Sparse Matmul --
+        RDM_sparse = V_sparse.T @ V_sparse.conj()
+        RDM_m = RDM_sparse.toarray()
 
     # Final Cleanup
-    if np.isrealobj(psi) and RDM_m.dtype.kind == 'c':
-        return RDM_m.real
+    if not is_complex:
+        return np.real(RDM_m)
     
     return RDM_m
