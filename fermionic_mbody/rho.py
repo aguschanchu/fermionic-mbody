@@ -21,7 +21,7 @@ from typing import List, Tuple, Dict, Optional, Sequence, Callable
 
 import numpy as np
 import openfermion as of
-import sparse
+
 from multiprocessing import cpu_count
 from math import comb
 from functools import wraps
@@ -303,7 +303,7 @@ def _paired_reduce_mask(mask_full: int, m_pairs: int) -> int:
             red |= (1 << p)
     return red
 
-def _rho_m_gen_paired_isomorphism(basis: FixedBasis, m: int, n_workers: int | None) -> sparse.COO:
+def _rho_m_gen_paired_isomorphism(basis: FixedBasis, m: int, n_workers: int | None) -> sp_sparse.coo_array:
     """Handles the optimized RDM generator calculation for pairs=True using isomorphism."""
     
     # 1. Define the reduced system parameters
@@ -329,18 +329,18 @@ def _rho_m_gen_paired_isomorphism(basis: FixedBasis, m: int, n_workers: int | No
 
     # 3. Handle edge cases
     if D_N == 0 or D_m == 0 or m < 0:
-        return sparse.COO([], [], shape=shape)
+        return sp_sparse.coo_array([], [], shape=shape)
         
     if m == 0:
         # m=0 RDM is the identity tensor.
         eye = sp_sparse.eye(D_N, dtype=float)
-        return sparse.COO(eye).reshape((1, 1, D_N, D_N))
+        return sp_sparse.coo_array(eye).reshape((1, 1, D_N, D_N))
 
     # 4. Construct the reduced N-body basis (P particles in d/2 modes).
     try:
         basis_P_red = FixedBasis(d_red, P, pairs=False)
     except Exception:
-        return sparse.COO([], [], shape=shape)
+        return sp_sparse.coo_array([], [], shape=shape)
 
     # 5. Critical check for isomorphism. The optimization relies on FixedBasis preserving the order.
     if basis.size != basis_P_red.size:
@@ -367,11 +367,12 @@ def _rho_m_gen_paired_isomorphism(basis: FixedBasis, m: int, n_workers: int | No
 
     # Remap last two axes (k,l) from reduced order to parent basis order
     coords = T_red.coords
-    new_coords = np.vstack([coords[0],
-                            coords[1],
-                            perm[coords[2]],
-                            perm[coords[3]]])
-    return sparse.COO(new_coords, T_red.data, shape=T_red.shape)
+    new_coords = (coords[0],
+                    coords[1],
+                    perm[coords[2]],
+                    perm[coords[3]])
+    
+    return sp_sparse.coo_array((T_red.data, new_coords), shape=shape)
 
 # ---------------------------------------------------------------------
 # Optimized generator worker 
@@ -423,9 +424,10 @@ def _process_chunk_gen_csr(args):
 
 def rho_m_gen(
     basis: FixedBasis, m: int, *, n_workers: int | None = None, _statistics: str = 'fermionic'
-) -> sparse.COO:
+) -> sp_sparse.coo_array:
     """
-    Build the sparse ρ(m) tensor.
+    Build the sparse ρ(m) tensor as a SciPy N-dimensional coo_array.
+    Shape: (D_m, D_m, D_N, D_N)
     """
     if basis.pairs and _statistics == 'fermionic':
         return _rho_m_gen_paired_isomorphism(basis, m, n_workers=n_workers)
@@ -439,11 +441,15 @@ def rho_m_gen(
     shape = (D_m, D_m, D_N, D_N)
 
     if m == 0:
-        eye = sp_sparse.eye(D_N, dtype=float)
-        return sparse.COO(eye).reshape((1, 1, D_N, D_N))
+        # Identity tensor: indices (0, 0, k, k)
+        idx = np.arange(D_N, dtype=np.int64)
+        zeros = np.zeros(D_N, dtype=np.int64)
+        # SciPy coords: tuple of arrays
+        coords = (zeros, zeros, idx, idx)
+        data = np.ones(D_N, dtype=float)
+        return sp_sparse.coo_array((data, coords), shape=shape)
 
-    # 1. Calculate connections (Reuse the optimized CSR logic from direct solver)
-    # Ensure keys are sorted integers
+    # 1. Calculate connections (Logic unchanged)
     basis_indices = {
         int(m): sorted([i for i in range(basis.d) if (int(m) >> i) & 1]) 
         for m in basis.bitmasks
@@ -454,11 +460,10 @@ def rho_m_gen(
     
     D_Nm = len(sorted_Nm_masks)
     if D_Nm == 0:
-        return sparse.COO([], [], shape=shape)
+        return sp_sparse.coo_array(([], ([], [], [], [])), shape=shape)
 
-    # 2. Parallel Processing
+    # 2. Parallel Processing (Logic unchanged)
     n_workers = _ensure_workers(n_workers)
-    
     max_dim = max(D_m, D_N)
     coord_dtype = np.int32 if max_dim <= 2**31 - 1 else np.int64
 
@@ -480,12 +485,12 @@ def rho_m_gen(
     val_chunks = [r[1] for r in results if r[0].size > 0]
 
     if not idx_chunks:
-        return sparse.COO([], [], shape=shape)
+        return sp_sparse.coo_array(([], ([], [], [], [])), shape=shape)
 
     coords_T = np.concatenate(idx_chunks, axis=0).T
     data = np.concatenate(val_chunks, axis=0)
     
-    return sparse.COO(coords_T, data, shape=shape)
+    return sp_sparse.coo_array((data, tuple(coords_T)), shape=shape)
 
 # ---------------------------------------------------------------------
 # legacy generic ρ(m) tensor
@@ -523,7 +528,7 @@ def _process_m_chunk(
 # .....................................................................
 def rho_m_gen_legacy(
     basis: FixedBasis, m: int, *, n_workers: int | None = None
-) -> sparse.COO:
+) -> sp_sparse.coo_array:
     """
     Build the sparse ρ(m) tensor with indices [i, j, r, c].
 
@@ -538,7 +543,7 @@ def rho_m_gen_legacy(
 
     Returns
     -------
-    sparse.COO
+    sp_sparse.coo_array
         Shape (m_dim, m_dim, N_dim, N_dim) where
         m_dim = |FixedBasis(d, num=m)| and
         N_dim = basis.size.
@@ -563,7 +568,7 @@ def rho_m_gen_legacy(
         val_list.extend(val)
 
     coords = np.asarray(idx_list).T
-    return sparse.COO(coords, val_list, shape=shape)
+    return sp_sparse.coo_array((val_list, tuple(coords)), shape=shape)
 
 
 # ---------------------------------------------------------------------
@@ -605,7 +610,7 @@ def _block_worker(
     return indices, values
 
 # .....................................................................
-def rho_2_block_gen(basis: FixedBasis, *, n_workers: int | None = None) -> sparse.COO:
+def rho_2_block_gen(basis: FixedBasis, *, n_workers: int | None = None) -> sp_sparse.coo_array:
     """
     Generate the pair-scattering block
 
@@ -636,21 +641,19 @@ def rho_2_block_gen(basis: FixedBasis, *, n_workers: int | None = None) -> spars
 
     shape = (m_pairs**2, m_pairs**2, basis.size, basis.size)
     coords = np.asarray(idx_list).T
-    return sparse.COO(coords, val_list, shape=shape)
+    return sp_sparse.coo_array((val_list, tuple(coords)), shape=shape)
 
 # .....................................................................
-def antisymmetrise_block(rho: sparse.COO) -> sparse.COO:
+def antisymmetrise_block(rho: sp_sparse.coo_array) -> sp_sparse.coo_array:
     """
     Project the ordered block ρ₂[i j , k l] onto the antisymmetric subspace
     and return ρ̄₂[ i<j , k<l ].
     """
-    # infer the number of pairs from the size of the first index
-    m_pairs = int(round(np.sqrt(rho.shape[0])))
-    if m_pairs * m_pairs != rho.shape[0]:
-        raise ValueError("ρ has not the expected shape (m², m², …)")
-
-    # ---------------------------------------------------------------------
-    # build the antisymmetriser  P  (same code as before)
+    m_sq = rho.shape[0]
+    m_pairs = int(round(np.sqrt(m_sq)))
+    N_dim = rho.shape[2]
+    
+    # Build Antisymmetriser P (n_pairs x m^2)
     pairs = [(i, j) for i in range(m_pairs) for j in range(i + 1, m_pairs)]
     n_pairs = len(pairs)
 
@@ -660,14 +663,19 @@ def antisymmetrise_block(rho: sparse.COO) -> sparse.COO:
         cols.extend([i * m_pairs + j, j * m_pairs + i])
         data.extend([+1 / np.sqrt(2), -1 / np.sqrt(2)])
 
-    P = sparse.COO(np.vstack([rows, cols]), data,
-                   shape=(n_pairs, m_pairs ** 2))
+    P = sp_sparse.coo_array((data, (rows, cols)), shape=(n_pairs, m_sq))
 
-    # ---------------------------------------------------------------------
-    # ρ̄₂ = P · ρ₂ · Pᵀ
-    tmp = sparse.tensordot(P, rho, axes=(1, 0))       # P · ρ
-    rho_bar = sparse.tensordot(tmp, P.T, axes=(1, 0)) # … · Pᵀ
-    return rho_bar
+    # Compute (P ⊗ P) applied to ρ
+    P_kron = sp_sparse.kron(P, P)
+    
+    # Reshape ρ to (m^4, N^2) to separate System (indices 0,1) from Env (2,3)
+    rho_flat = rho.reshape((m_sq * m_sq, N_dim * N_dim))
+    
+    # Apply Projector: (n_pairs^2, N^2)
+    res_flat = P_kron @ rho_flat
+    
+    # Reshape back to 4D
+    return res_flat.reshape((n_pairs, n_pairs, N_dim, N_dim))
 
 # ---------------------------------------------------------------------
 # ρ₂ *k \bar k* diagonal block
@@ -704,7 +712,7 @@ def _kkbar_worker(
 
 
 # .....................................................................
-def rho_2_kkbar_gen(basis: FixedBasis, *, n_workers: int | None = None) -> sparse.COO:
+def rho_2_kkbar_gen(basis: FixedBasis, *, n_workers: int | None = None) -> sp_sparse.coo_array:
     """
     Generate the diagonal k \bar k block
 
@@ -735,14 +743,18 @@ def rho_2_kkbar_gen(basis: FixedBasis, *, n_workers: int | None = None) -> spars
         val_list.extend(val)
 
     shape = (m_pairs, m_pairs, basis.size, basis.size)
+    
+    if not idx_list:
+        return sp_sparse.coo_array(([], ([],[],[],[])), shape=shape)
+
     coords = np.asarray(idx_list).T
-    return sparse.COO(coords, val_list, shape=shape)
+    return sp_sparse.coo_array((val_list, tuple(coords)), shape=shape)
 
 
 # ---------------------------------------------------------------------
 # contraction helper
 # ---------------------------------------------------------------------
-def rho_m(state: np.ndarray, rho_arrays: sparse.COO) -> sparse.COO:
+def rho_m(state: np.ndarray, rho_arrays: sp_sparse.coo_array) -> sp_sparse.coo_array:
     """
     Contract a state (ket, density matrix, or batch) with a pre-built ρ(m).
 
@@ -759,38 +771,56 @@ def rho_m(state: np.ndarray, rho_arrays: sparse.COO) -> sparse.COO:
         • Batch of kets (2D, B x N_dim).
         • Batch of density matrices (3D, B x N_dim x N_dim).
         
-    rho_arrays : sparse.COO
+    rho_arrays : sp_sparse.coo_array
         Tensor built by rho_m_gen.
     """
+    if not sp_sparse.issparse(rho_arrays):
+        rho_arrays = sp_sparse.coo_array(rho_arrays)
+
+    D_m = rho_arrays.shape[0] 
+    D_N = rho_arrays.shape[2] 
+    
+    # Flatten Generator T_{ijkl} -> Matrix_{(ij), (kl)}
+    gen_flat = rho_arrays.reshape((D_m * D_m, D_N * D_N))
+    
     ndim = state.ndim
-    N_dim = rho_arrays.shape[2]
 
-    # Case 1: Single ket (1D)
+    def format_out(res_flat):
+        if res_flat.ndim == 1:
+            return res_flat.reshape(D_m, D_m)
+        return res_flat.T.reshape(-1, D_m, D_m) 
+
+    # Case 1: Single Ket (1D)
     if ndim == 1:
-        if state.shape[0] != N_dim:
-             raise ValueError(f"State dimension mismatch. Expected ({N_dim},), got {state.shape}.")
-        return sparse.einsum("k,ijkl,l->ij", np.conj(state), rho_arrays, state)
+        if state.shape[0] != D_N:
+             raise ValueError("State dimension mismatch.")
+        # Vector corresponding to rho_{lk} = psi_l * psi*_k
+        # Flattened index K = k*Dn + l
+        vec = np.outer(np.conj(state), state).ravel()
+        return format_out(gen_flat @ vec).reshape(D_m, D_m)
 
-    # Case 2: Density Matrix (2D, square) or Batch of Kets (2D, B x dim)
-    if ndim == 2:
-        if state.shape == (N_dim, N_dim): # Density matrix ρ
-            return sparse.einsum("ijkl,lk->ij", rho_arrays, state)
-        
-        elif state.shape[1] == N_dim: # Batch of kets (B, dim)
-            return sparse.einsum("bk,ijkl,bl->bij", np.conj(state), rho_arrays, state)
-        
-        else:
-            raise ValueError(f"Invalid shape for 2D state: {state.shape}. Expected ({N_dim}, {N_dim}) or (B, {N_dim}).")
+    # Case 2: Density Matrix (2D)
+    if ndim == 2 and state.shape == (D_N, D_N):
+        # state[l, k] corresponds to rho_{lk}. 
+        # We need flattened order k*Dn + l.
+        # Flattening state.T puts indices in (k,l) order.S
+        vec = state.T.ravel()
+        return format_out(gen_flat @ vec).reshape(D_m, D_m)
 
-    # Case 3: Batch of Density Matrices (3D, B x dim x dim)
+    # Case 3: Batch of Kets (B, N)
+    if ndim == 2 and state.shape[1] == D_N:
+        # Batch outer product: V[b, k*Dn + l] = psi*_bk * psi_bl
+        vecs = (np.conj(state)[:, :, None] * state[:, None, :]).reshape(state.shape[0], -1)
+        res = gen_flat @ vecs.T
+        return format_out(res)
+
+    # Case 4: Batch of Density Matrices (3D)
     if ndim == 3:
-        if state.shape[1:] == (N_dim, N_dim):
-            # RDM[b, i, j] = Σ_{k,l} T[i, j, k, l] ρ_b[l, k]
-            return sparse.einsum("ijkl,blk->bij", rho_arrays, state)
-        else:
-             raise ValueError(f"Invalid shape for 3D state: {state.shape}. Expected (B, {N_dim}, {N_dim}).")
+        vecs = state.transpose(0, 2, 1).reshape(state.shape[0], -1)
+        res = gen_flat @ vecs.T
+        return format_out(res)
 
-    raise ValueError("state must be a ket, density matrix, or batch thereof (ndim 1-3 supported).")
+    raise ValueError("Invalid state shape.")
 
 # =====================================================================
 # DIRECT M-RDM CALCULATION 
